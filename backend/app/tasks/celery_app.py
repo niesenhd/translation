@@ -75,30 +75,46 @@ def _check_task_alive(task_id: str) -> None:
         s.close()
 
 
-# ====== 应用层并发闸门 ======
-# 通过 Redis 原子计数器实现，使管理员在后台调整 max_concurrency 能即时生效。
-# Celery worker 的 --concurrency 只控制"同时执行的任务数"（进程/线程槽位），
-# 而本闸门在此基础上再加一层"全局翻译许可"，确保即使 worker 槽位较多，
-# 实际并发翻译的文件数也不会超过管理员设定的上限。
+# ====== 应用层并发闸门（基于 Redis ZSET + TTL 自愈）======
+# 通过 ZSET 记录"正在翻译"的任务（member=task_id，score=最近心跳时间），
+# 使管理员在后台调整 max_concurrency 能即时生效。
+# Celery worker 的 --concurrency 只控制"同时执行的任务数"（进程槽位），
+# 本闸门在其上再加一层"全局翻译许可"，确保实际并发翻译文件数不超过管理员上限。
+#
+# 相比单纯的 INCR 计数器，ZSET + TTL 方案解决两个隐患：
+# 1) 槽位泄漏：worker 子进程被 OOM/SIGKILL 强杀（finally 来不及释放）时，
+#    其条目会在 TTL 后自动过期回收，不会永久占用名额。
+# 2) 误清计数：无需任何"启动清零"逻辑，从根本上避免 beat / 多 worker 进程
+#    在他人正运行时把计数器清零导致超额放行。
 
-_CONCURRENCY_KEY = "translation:running_count"
+_CONCURRENCY_ZSET = "translation:running"
+# 槽位心跳过期秒数：超过此时长无心跳即视为死任务被回收。
+# 需大于"任务获得槽位 → 第一次进度回调"的最坏耗时（大扫描件 OCR 较慢），留足余量。
+_SLOT_TTL_SECONDS = 600
+
+# 原子获取脚本：清理僵尸 → 已在册则续期放行 → 在册数未满则登记放行 → 否则拒绝
+_ACQUIRE_LUA = """
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local ttl = tonumber(ARGV[2])
+local maxc = tonumber(ARGV[3])
+local member = ARGV[4]
+redis.call('ZREMRANGEBYSCORE', key, 0, now - ttl)
+if redis.call('ZSCORE', key, member) then
+    redis.call('ZADD', key, now, member)
+    return 1
+end
+if redis.call('ZCARD', key) < maxc then
+    redis.call('ZADD', key, now, member)
+    return 1
+end
+return 0
+"""
 
 
-# Worker 启动时重置并发计数器，避免上次异常退出导致计数器泄漏（槽位被占满但无人释放）
-@celery_app.on_after_configure.connect
-def _reset_concurrency_on_start(sender, **kwargs):
-    """worker 启动时把 running_count 归零。
-
-    worker 重启意味着所有正在执行的任务已经丢失（不会有 release 调用），
-    所以计数器必然是脏的，直接清零是最安全的做法。
-    """
-    try:
-        import redis as _redis
-        r = _redis.from_url(_settings.redis_url, decode_responses=True)
-        r.set(_CONCURRENCY_KEY, 0)
-        logger.info("Worker 启动：并发计数器已重置为 0")
-    except Exception as exc:
-        logger.warning("Worker 启动：重置并发计数器失败（降级忽略）：%s", exc)
+def _redis_client():
+    import redis
+    return redis.from_url(_settings.redis_url, decode_responses=True)
 
 
 def _get_max_concurrency() -> int:
@@ -122,25 +138,25 @@ def _get_max_concurrency() -> int:
 def _acquire_concurrency_slot(task_id: str, poll_interval: float = 2.0) -> None:
     """获取翻译许可，超出上限时阻塞等待。
 
-    使用 Redis INCR 原子自增，拿到超过上限的号会被立即 DECR 退回并等待重试。
-    在等待期间定期检查任务是否已被删除，避免对已删任务继续占用 worker。
+    用 Redis ZSET + Lua 原子判断：清理 TTL 过期的僵尸条目后，在册数未满才放行。
+    等待期间定期检查任务是否已被删除，避免对已删任务继续占用 worker。
     """
-    import redis
-
-    r = redis.from_url(_settings.redis_url, decode_responses=True)
     try:
+        r = _redis_client()
+        acquire = r.register_script(_ACQUIRE_LUA)
         while True:
             # 任务在排队期间可能已被删除
             _check_task_alive(task_id)
 
             max_c = _get_max_concurrency()
-            current = r.incr(_CONCURRENCY_KEY)
-            if current <= max_c:
-                logger.info("任务 %s 获得并发槽位（当前 %d/%d）", task_id, current, max_c)
+            ok = acquire(
+                keys=[_CONCURRENCY_ZSET],
+                args=[time.time(), _SLOT_TTL_SECONDS, max_c, task_id],
+            )
+            if ok == 1:
+                logger.info("任务 %s 获得并发槽位（上限 %d）", task_id, max_c)
                 return
-            # 超限：退回计数并等待
-            r.decr(_CONCURRENCY_KEY)
-            logger.info("任务 %s 等待并发槽位（当前 %d，上限 %d）", task_id, current - 1, max_c)
+            logger.info("任务 %s 等待并发槽位（上限 %d）", task_id, max_c)
             time.sleep(poll_interval)
     except TaskCancelled:
         raise
@@ -149,16 +165,18 @@ def _acquire_concurrency_slot(task_id: str, poll_interval: float = 2.0) -> None:
         return
 
 
-def _release_concurrency_slot() -> None:
-    """释放翻译许可。"""
-    import redis
-
+def _heartbeat_concurrency_slot(task_id: str) -> None:
+    """刷新槽位心跳（任务执行中周期调用），避免长任务被 TTL 误回收。"""
     try:
-        r = redis.from_url(_settings.redis_url, decode_responses=True)
-        # DECR 但不低于 0
-        current = r.decr(_CONCURRENCY_KEY)
-        if current is not None and current < 0:
-            r.set(_CONCURRENCY_KEY, 0)
+        _redis_client().zadd(_CONCURRENCY_ZSET, {task_id: time.time()})
+    except Exception:
+        pass
+
+
+def _release_concurrency_slot(task_id: str) -> None:
+    """释放翻译许可。"""
+    try:
+        _redis_client().zrem(_CONCURRENCY_ZSET, task_id)
     except Exception as exc:
         logger.warning("释放并发槽位失败：%s", exc)
 
@@ -213,11 +231,23 @@ def run_translation_task(self, task_id: str) -> None:  # noqa: ARG001
         # 注意：on_progress 会被多个翻译线程并发调用，SQLAlchemy Session 非线程安全，
         # 必须用锁串行化 DB 操作。
         last_written = {"v": 10}
+        last_alive_check = {"t": 0.0}
         progress_lock = threading.Lock()
 
         def on_progress(done: int, total: int) -> None:
-            # 任务已被删除/取消 -> 抛 TaskCancelled 让翻译循环立即退出
-            _check_task_alive(task_id)
+            # 存活检查 + 槽位心跳：节流到最多每 2s 一次。
+            # 否则每完成一段都查一次库，高并发下会打满连接池。
+            now = time.time()
+            do_check = False
+            with progress_lock:
+                if now - last_alive_check["t"] >= 2.0:
+                    last_alive_check["t"] = now
+                    do_check = True
+            if do_check:
+                # 已删除则抛 TaskCancelled，让翻译循环立即退出
+                _check_task_alive(task_id)
+                # 刷新并发槽位心跳，避免长任务被 TTL 误回收
+                _heartbeat_concurrency_slot(task_id)
             pct = 10 + int((done / max(total, 1)) * 80)
             pct = max(10, min(90, pct))
             with progress_lock:
@@ -251,6 +281,13 @@ def run_translation_task(self, task_id: str) -> None:  # noqa: ARG001
             glossary=glossary,
             tm_lookup=lookup_tm,
         )
+        # 每个任务开始前重置模型单例，确保管理员后台切换模型后 worker 进程立即生效。
+        # （reset_* 只影响本 worker 子进程的内存单例；prefork 下同一进程同一时刻只跑
+        #  一个任务，故此处重置安全，不会影响其它正在执行的任务。）
+        from app.services.translator import reset_translator
+        from app.services.ocr import reset_ocr_client
+        reset_translator()
+        reset_ocr_client()
         translator = get_translator()
 
         result_bytes, out_ext = translate_file(
@@ -292,5 +329,5 @@ def run_translation_task(self, task_id: str) -> None:  # noqa: ARG001
         return
     finally:
         if slot_acquired:
-            _release_concurrency_slot()
+            _release_concurrency_slot(task_id)
         db.close()

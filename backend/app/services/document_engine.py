@@ -1599,6 +1599,11 @@ def translate_file(
         # .ppt 输出转为 .pptx（LibreOffice 转换后走 pptx 翻译路径）
         return translate_ppt(data, translator, ctx), "pptx"
     if ext == "pdf":
+        # 对照模式下译文翻倍，写回原 PDF span 的 bbox 会严重溢出 / 字号骤缩到不可读，
+        # 因此强制走"转 Word"路径——段落可自由换行，对照内容才能正常显示。
+        if ctx.output_mode == OutputMode.BILINGUAL:
+            logger.info("PDF + 对照模式：强制输出 Word，避免就地替换文字溢出")
+            return translate_pdf_to_docx(data, translator, ctx), "docx"
         if pdf_output_format == "docx":
             return translate_pdf_to_docx(data, translator, ctx), "docx"
         return translate_pdf_inplace(data, translator, ctx), "pdf"

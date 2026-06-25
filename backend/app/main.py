@@ -47,8 +47,9 @@ def _ensure_columns() -> None:
         "ALTER TABLE translation_tasks "
         "ADD COLUMN IF NOT EXISTS pdf_output_format VARCHAR(8) NOT NULL DEFAULT 'pdf'",
         # 2026-06-14: 新增 translate_images（是否翻译图片中的文字）
+        # 默认 'no'：与需求 2.2 默认项「仅翻译文档文字」及模型 server_default 一致
         "ALTER TABLE translation_tasks "
-        "ADD COLUMN IF NOT EXISTS translate_images VARCHAR(8) NOT NULL DEFAULT 'yes'",
+        "ADD COLUMN IF NOT EXISTS translate_images VARCHAR(8) NOT NULL DEFAULT 'no'",
     ]
     with SessionLocal() as session:
         for sql in statements:

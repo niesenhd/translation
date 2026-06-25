@@ -34,7 +34,8 @@ async def upload_and_translate(
     source_lang: Annotated[str, Form()] = "auto",
     output_mode: Annotated[OutputMode, Form()] = OutputMode.PLAIN,
     pdf_output_format: Annotated[PdfOutputFormat, Form()] = PdfOutputFormat.PDF,
-    translate_images: Annotated[TranslateImagesOption, Form()] = TranslateImagesOption.YES,
+    # 默认"仅翻译文档文字，图片保持原样"（需求 2.2 默认项），与模型默认一致
+    translate_images: Annotated[TranslateImagesOption, Form()] = TranslateImagesOption.NO,
     user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> TaskCreateResponse:
