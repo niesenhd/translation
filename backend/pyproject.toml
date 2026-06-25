@@ -1,0 +1,38 @@
+[project]
+name = "translation-backend"
+version = "0.1.0"
+description = "Legal document translation backend"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.4.0",
+    "sqlalchemy>=2.0.30",
+    "alembic>=1.13.2",
+    "psycopg[binary]>=3.2.1",
+    "celery>=5.4.0",
+    "redis>=5.0.7",
+    "minio>=7.2.7",
+    "httpx>=0.27.0",
+    "openai>=1.40.0",
+    "python-multipart>=0.0.9",
+    "python-docx>=1.1.2",
+    "python-pptx>=1.0.2",
+    "openpyxl>=3.1.5",
+    "xlrd>=2.0.1",
+    "pdf2docx>=0.5.8",
+    "pypdf>=4.3.1",
+    "pymupdf>=1.24.10",
+    "pillow>=10.4.0",
+    "markdown-it-py>=3.0.0",
+    "python-jose[cryptography]>=3.3.0",
+    "loguru>=0.7.2",
+    "paddleocr>=3.7.0",
+    "paddlepaddle>=3.0.0,<3.1.0",
+    "paddlex[ocr]>=3.7.0",
+    "access-parser>=0.0.6",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
