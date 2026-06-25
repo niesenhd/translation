@@ -70,6 +70,10 @@ translation/
   正文失去引用、Word 不再显示（脚注占比大的文书表现为"译文只有一部分"）。新增
   `_run_is_preservable`，把脚注/尾注引用、字段（页码/目录/交叉引用 fldChar·instrText）、
   图片/公式一并视为不可覆盖，写回时跳过。实测 NVCA 法律意见书正文引用 17→17 保留。
+- **DOCX 页眉/页脚翻译补全**：`doc.paragraphs` 不含页眉页脚，此前完全未翻译（实测 NVCA
+  文档 footer 仍为英文）。新增 `_collect_docx_header_footer_paragraphs`，逐 section 收集
+  header/footer（含首页/奇偶页变体及其中表格），跳过 `is_linked_to_previous` 避免重复，
+  走与正文同一套写回。PDF（整页 span）与 PPTX（占位符 shape）路径本就覆盖，无需改。
 
 ## 快速启动
 
