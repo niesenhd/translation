@@ -258,6 +258,39 @@ def _collect_docx_paragraphs(doc: Document) -> list:
     return items
 
 
+def _collect_docx_header_footer_paragraphs(doc: Document) -> list:
+    """收集页眉/页脚（含首页、奇偶页变体，及其中表格）的可翻译段落。
+
+    doc.paragraphs 不含页眉页脚，需逐 section 单独取。
+    链接到上一节的页眉/页脚（is_linked_to_previous）没有自己的内容（继承自上一节），
+    跳过以避免对同一底层段落重复翻译。
+    """
+    items: list = []
+    for section in doc.sections:
+        for hf in (
+            section.header, section.footer,
+            section.first_page_header, section.first_page_footer,
+            section.even_page_header, section.even_page_footer,
+        ):
+            if hf is None:
+                continue
+            try:
+                if hf.is_linked_to_previous:
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+            for paragraph in hf.paragraphs:
+                if paragraph.text.strip():
+                    items.append(paragraph)
+            for table in hf.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        for paragraph in cell.paragraphs:
+                            if paragraph.text.strip():
+                                items.append(paragraph)
+    return items
+
+
 def _get_docx_footnote_paragraphs(doc: Document) -> tuple[list, dict]:
     """提取脚注（footnotes）和尾注（endnotes）中的段落。
 
@@ -369,8 +402,9 @@ def _translate_docx_inplace(doc: Document, translator: Translator, ctx: Translat
     注意：_translate_many 返回的字符串已经按 ctx.output_mode 处理过对照逻辑，
     这里直接写回即可，不要再次调用 _bilingual_join。
     """
-    # 正文段落（含表格内）
-    paragraphs = _collect_docx_paragraphs(doc)
+    # 正文段落（含表格内）+ 页眉/页脚段落（两者都是普通 python-docx 段落，
+    # 走 .text + _write_translated_to_paragraph 同一套写回逻辑）
+    paragraphs = _collect_docx_paragraphs(doc) + _collect_docx_header_footer_paragraphs(doc)
     # 脚注 + 尾注段落
     fn_paragraphs, fn_roots_map = _get_docx_footnote_paragraphs(doc)
     all_paragraphs = paragraphs + fn_paragraphs
