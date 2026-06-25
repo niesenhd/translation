@@ -324,19 +324,40 @@ def _run_has_drawing(run) -> bool:
     )
 
 
+def _run_is_preservable(run) -> bool:
+    """判断 run 是否必须原样保留（绝不可被 run.text= 覆盖或清空）。
+
+    `run.text` 的 setter 会先调用 clear_content() 删除 run 内**所有**子元素，
+    因此凡含以下特殊元素的 run 都必须跳过，否则内容会丢失：
+    - 图片 / 嵌入对象 / 公式：w:drawing / w:pict / w:object
+    - 脚注 / 尾注引用标记：w:footnoteReference / w:endnoteReference（正文里指向脚注的小标记）
+      及 w:footnoteRef / w:endnoteRef（脚注文本内的回指标记）——
+      一旦丢失，脚注虽仍在 footnotes.xml 中但正文无引用，Word 不再显示，
+      表现为"译文只有一部分"（脚注占比大的法律文书尤其明显）。
+    - 字段：w:fldChar / w:instrText（页码、目录、交叉引用等），清空会破坏字段。
+    """
+    el = run._element
+    return bool(el.xpath(
+        ".//w:drawing | .//w:pict | .//w:object | "
+        ".//w:footnoteReference | .//w:endnoteReference | "
+        ".//w:footnoteRef | .//w:endnoteRef | "
+        ".//w:fldChar | .//w:instrText"
+    ))
+
+
 def _write_translated_to_paragraph(paragraph, new_text: str) -> None:
     """把翻译后的文本写回段落，保留其中的图片/嵌入对象。
 
     策略：
-    - 只把整段译文写入第一个"有文本的 run"，保留其字体格式
-    - 其他"有文本的 run"清空文本（不会破坏其格式）
-    - 含图片的 run 完全不动
-    - 段落里完全没有文本 run（只有图片）时不做任何修改
+    - 只把整段译文写入第一个"普通文本 run"，保留其字体格式
+    - 其他"普通文本 run"清空文本（不会破坏其格式）
+    - 不可覆盖的 run（图片/脚注引用/字段等）完全不动，避免内容丢失
+    - 段落里完全没有普通文本 run（只有图片/脚注引用）时不做任何修改
     """
     runs = list(paragraph.runs)
-    text_runs = [r for r in runs if not _run_has_drawing(r)]
+    text_runs = [r for r in runs if not _run_is_preservable(r)]
     if not text_runs:
-        return  # 整段无文本 run（只有图片），保持原样
+        return  # 无可写入的普通文本 run（只有图片/脚注引用等），保持原样
     text_runs[0].text = new_text
     for r in text_runs[1:]:
         r.text = ""
