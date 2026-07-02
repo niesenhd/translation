@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import re
 import threading
 
 from openai import OpenAI
@@ -14,20 +15,28 @@ import time
 from app.core.config import get_settings
 
 SYSTEM_PROMPT = (
-    "You are a professional legal document translator. "
-    "Translate the user's text into {target_lang}. "
-    "Strictly preserve original formatting markers, line breaks, indentation, and inline placeholders. "
-    "Do NOT add explanations. Do NOT translate code, formulas, URLs, email addresses, or proper nouns that should remain in the original form. "
-    "Only output the translated text."
-    "{glossary_section}"
+    "You are a senior legal translator for a law firm, specializing in Chinese-English legal document translation.\n"
+    "Translate the user's text into {target_lang}.\n\n"
+    "STYLE REQUIREMENTS:\n"
+    "- Use formal, precise legal register (e.g., 'shall' for obligations, 'may' for permissions).\n"
+    "- Preserve the original meaning faithfully; do not add interpretations or omissions.\n"
+    "- Keep sentence structure close to the source where target-language grammar allows.\n"
+    "- Maintain consistent terminology throughout the document.\n\n"
+    "PRESERVE EXACTLY (do not translate or alter):\n"
+    "- Formatting markers, line breaks, indentation, and inline placeholders like {{...}}.\n"
+    "- Article/clause numbers, cross-references, defined terms in quotation marks.\n"
+    "- Code, formulas, URLs, email addresses.\n"
+    "- Proper nouns (names of people, entities, statutes) that should remain in original form.\n\n"
+    "OUTPUT: Only the translated text. No explanations, no notes.{glossary_section}"
 )
 
 GLOSSARY_SECTION = (
-    "\n\nIMPORTANT GLOSSARY (must follow):\n"
-    "The following terms must be translated exactly as specified:\n"
+    "\n\nMANDATORY GLOSSARY — apply consistently:\n"
+    "The following terms appear in the source text and MUST be translated as specified:\n"
     "{glossary}\n"
-    "For terms marked [STRICT], you MUST use the specified translation. "
-    "For terms marked [PREFERRED], you SHOULD use the specified translation when appropriate."
+    "- [STRICT] terms: you MUST use the exact specified translation, no variants.\n"
+    "- [PREFERRED] terms: use the specified translation unless context clearly demands otherwise.\n"
+    "Apply the same glossary translation every time the term recurs in the document."
 )
 
 
@@ -68,6 +77,101 @@ def resolve_language_name(code: str) -> str:
     if not code:
         return "English"
     return LANGUAGE_NAMES.get(code, LANGUAGE_NAMES.get(code.split("-")[0], code))
+
+
+# ── 术语匹配 ────────────────────────────────────────────────────────
+# 替换原来的朴素子串匹配，解决两类问题：
+# 1. 误配：英文短术语 "act" 会命中 "actual"；中文 "法" 命中几乎所有句子
+# 2. 漏配：无法识别词边界、无法去重（同一术语多条命中）
+
+# 中文术语的最小长度：单字术语歧义太大，强制要求 >= 2 字
+_ZH_MIN_LEN = 2
+# 英文术语的最小长度：1-2 字母的术语误配率高，强制要求 >= 3 字符
+_EN_MIN_LEN = 3
+# 单段最多注入的术语条数，防止 prompt 膨胀
+_MAX_GLOSSARY_HITS = 40
+
+
+def _match_glossary(text: str, glossary: list[dict]) -> list[dict]:
+    """从术语库中筛选出在 text 中实际出现的术语。
+
+    匹配策略：
+    - 中文术语：直接子串匹配（中文无空格分词），但要求长度 >= 2
+    - 英文术语：用正则词边界 \\b 匹配，避免 act 命中 actual
+    - 最长优先：若短术语是某长术语的子串且两者都命中，保留长术语
+    - 上限截断：超过 _MAX_GLOSSARY_HITS 条时，strict 优先、再按长度降序
+    """
+    hits: list[dict] = []
+    hit_terms: set[str] = set()  # 已命中的 source_term（去重）
+
+    for term in glossary:
+        src = term.get("source_term")
+        if not src:
+            continue
+        src_stripped = src.strip()
+        if not src_stripped:
+            continue
+
+        is_ascii = src_stripped.isascii()
+
+        # 长度过滤：短术语误配率高
+        if is_ascii:
+            if len(src_stripped) < _EN_MIN_LEN:
+                continue
+        else:
+            if len(src_stripped) < _ZH_MIN_LEN:
+                continue
+
+        matched = False
+        if is_ascii:
+            # 英文：词边界匹配，大小写不敏感
+            # 转义正则特殊字符，防止 source_term 含 ( ) . 等导致误解析
+            pattern = r"\b" + re.escape(src_stripped) + r"\b"
+            if re.search(pattern, text, re.IGNORECASE):
+                matched = True
+        else:
+            # 中文：直接子串匹配
+            if src_stripped in text:
+                matched = True
+
+        if matched and src_stripped not in hit_terms:
+            hits.append(term)
+            hit_terms.add(src_stripped)
+
+    if not hits:
+        return []
+
+    # 最长优先去重：若 A 是 B 的子串且两者都命中，移除 A（保留更具体的 B）
+    # 例如 "违约" 和 "根本违约" 都命中时，只保留 "根本违约"
+    # 但 strict 级别的短术语保留（用户明确要求强制）
+    filtered: list[dict] = []
+    for term in hits:
+        src = term["source_term"].strip()
+        is_strict = term.get("priority") == "strict"
+        # 检查是否存在另一个更长的命中术语包含此术语
+        is_shadowed = False
+        if not is_strict:
+            for other in hits:
+                if other is term:
+                    continue
+                other_src = other["source_term"].strip()
+                if len(other_src) > len(src) and src in other_src:
+                    is_shadowed = True
+                    break
+        if not is_shadowed:
+            filtered.append(term)
+
+    # 上限截断：strict 优先，其次按术语长度降序（更具体的先保留）
+    if len(filtered) > _MAX_GLOSSARY_HITS:
+        filtered.sort(
+            key=lambda t: (
+                0 if t.get("priority") == "strict" else 1,
+                -len(t["source_term"]),
+            )
+        )
+        filtered = filtered[:_MAX_GLOSSARY_HITS]
+
+    return filtered
 
 
 class Translator(ABC):
@@ -128,13 +232,7 @@ class DashScopeTranslator(Translator):
         # 构建术语库提示
         glossary_section = ""
         if glossary:
-            # 按当前段落内容过滤：只传入实际出现的术语
-            # 避免术语库过大（数万条）撑爆 API token 上限
-            text_lower = text.lower()
-            relevant = [
-                t for t in glossary
-                if t.get("source_term") and t["source_term"].lower() in text_lower
-            ]
+            relevant = _match_glossary(text, glossary)
             if relevant:
                 lines = []
                 for term in relevant:
