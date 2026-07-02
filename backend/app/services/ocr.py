@@ -397,8 +397,10 @@ def _batch_translate(
                 tm_match = tm_lookup(text, source_lang, target_lang)
                 if tm_match and tm_match.get("similarity", 0) >= 0.8:
                     tm_reference = tm_match.get("target_text")
-                    if tm_match.get("similarity", 0) >= 0.95:
-                        results.append(tm_reference.strip() if tm_reference else text)
+                    # 仅归一化后逐字相等才直接复用；高相似非全等只作参考，
+                    # 防止旧记忆的数字/日期差异被原样写入
+                    if tm_match.get("exact") and tm_reference:
+                        results.append(tm_reference.strip())
                         continue
 
             translated = translator.translate(

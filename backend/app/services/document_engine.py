@@ -63,11 +63,13 @@ def _translate_text(translator: Translator, text: str, ctx: TranslationContext) 
     # 优先查翻译记忆库
     if ctx.tm_lookup is not None:
         tm_match = ctx.tm_lookup(text, ctx.source_lang, ctx.target_lang)
-        if tm_match and tm_match.get("similarity", 0) >= 0.95:
-            # 高置信度匹配（>=95%），直接使用 TM 结果
+        if tm_match and tm_match.get("exact"):
+            # 完全一致（归一化后逐字相等）才直接复用译文。
+            # 高相似但非全等（如仅日期/金额不同）绝不可直接套用——会把
+            # 旧记忆中的数字/当事人名写进当前文书。
             translated = tm_match["target_text"]
         elif tm_match and tm_match.get("similarity", 0) >= 0.8:
-            # 中等匹配（80-95%），将 TM 结果作为参考注入 prompt
+            # 高相似非全等（80%+），将 TM 结果作为参考注入 prompt
             translated = translator.translate(
                 text, ctx.target_lang, ctx.source_lang,
                 glossary=ctx.glossary,
@@ -77,6 +79,11 @@ def _translate_text(translator: Translator, text: str, ctx: TranslationContext) 
             translated = translator.translate(text, ctx.target_lang, ctx.source_lang, glossary=ctx.glossary)
     else:
         translated = translator.translate(text, ctx.target_lang, ctx.source_lang, glossary=ctx.glossary)
+    if not translated or not translated.strip():
+        # 空译文（API 安全过滤/截断返回空 content）一律保留原文兜底，
+        # 否则 docx 写回路径会把整段原文抹掉
+        logger.warning("译文为空，保留原文兜底：%.60s", text)
+        translated = text
     if ctx.output_mode == OutputMode.BILINGUAL:
         return _bilingual_join(text, translated)
     return translated
@@ -421,6 +428,9 @@ def _translate_docx_inplace(doc: Document, translator: Translator, ctx: Translat
     translated = _translate_many(texts, translator, ctx)
     for i, (para, original, new_text) in enumerate(zip(all_paragraphs, texts, translated)):
         if not original.strip():
+            continue
+        if not new_text or not new_text.strip():
+            # 空译文不写回（保留原文），防止段落内容被抹掉
             continue
         if i < len(paragraphs):
             _write_translated_to_paragraph(para, new_text)

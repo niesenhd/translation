@@ -22,12 +22,18 @@ def lookup_tm(source_text: str, source_lang: str, target_lang: str, threshold: f
     }
     src = lang_code_map.get(source_lang, source_lang.split("-")[0])
     tgt = lang_code_map.get(target_lang, target_lang.split("-")[0])
-    lang_pair = f"{src}→{tgt}"
 
     db = SessionLocal()
     try:
+        if src == "auto":
+            # 源语言未知（上传默认 auto）：按目标语匹配全部语对。
+            # 相似度阈值本身足以排除跨源语言的误匹配（不同语言的文本
+            # bigram 重合度极低），否则精确等值查询永远查不到 auto→xx。
+            condition = TranslationMemory.lang_pair.like(f"%→{tgt}")
+        else:
+            condition = TranslationMemory.lang_pair == f"{src}→{tgt}"
         entries = list(db.scalars(
-            select(TranslationMemory).where(TranslationMemory.lang_pair == lang_pair)
+            select(TranslationMemory).where(condition)
         ))
     finally:
         db.close()
@@ -52,6 +58,10 @@ def lookup_tm(source_text: str, source_lang: str, target_lang: str, threshold: f
             "source_text": best_match.source_text,
             "target_text": best_match.target_text,
             "similarity": round(best_sim, 3),
+            # exact：归一化后逐字相等。只有 exact 才允许直接复用译文——
+            # bigram Dice 对长段落不敏感，仅改动一个日期/金额相似度仍可
+            # >0.95，法律文书直接套用旧译文会引入事实错误。
+            "exact": source_normalized == best_match.source_text.strip().lower(),
         }
     return None
 
