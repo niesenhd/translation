@@ -10,7 +10,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -73,8 +73,19 @@ async def upload_and_translate(
     db.add(task)
     db.commit()
 
-    run_translation_task.delay(task_id)
+    _enqueue_or_fail(task, db)
     return TaskCreateResponse(id=task_id, status=TaskStatus.QUEUED)
+
+
+def _enqueue_or_fail(task: TranslationTask, db: Session) -> None:
+    """入队 Celery 任务；broker 不可用时把任务标 FAILED 而非永久卡在"排队中"。"""
+    try:
+        run_translation_task.delay(task.id)
+    except Exception as exc:  # noqa: BLE001
+        task.status = TaskStatus.FAILED
+        task.error_message = f"任务入队失败（消息队列不可用）：{str(exc)[:200]}"
+        db.commit()
+        raise HTTPException(status_code=503, detail="任务入队失败，请稍后重试") from exc
 
 
 @router.get("", response_model=list[TaskRead])
@@ -176,14 +187,21 @@ def retry_task(
         raise HTTPException(status_code=400, detail="仅失败或已完成的任务可重试")
     if not task.source_object:
         raise HTTPException(status_code=400, detail="原文已被清理，无法重试")
-    # 重置状态、清空错误信息，并入队
-    task.status = TaskStatus.QUEUED
-    task.progress = 0
-    task.error_message = None
-    task.result_object = None
+    # 条件更新"抢占"：并发的两个 retry 只有一个能把状态置回 QUEUED，
+    # 避免重复入队导致同一任务被翻译两次（worker 侧也有 QUEUED→RUNNING 抢占兜底）
+    claimed = db.execute(
+        update(TranslationTask)
+        .where(
+            TranslationTask.id == task_id,
+            TranslationTask.status.in_([TaskStatus.FAILED, TaskStatus.SUCCEEDED]),
+        )
+        .values(status=TaskStatus.QUEUED, progress=0, error_message=None, result_object=None)
+    )
     db.commit()
+    if claimed.rowcount != 1:
+        raise HTTPException(status_code=409, detail="任务状态已变化，请刷新后重试")
     db.refresh(task)
-    run_translation_task.delay(task_id)
+    _enqueue_or_fail(task, db)
     return task
 
 

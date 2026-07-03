@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     # Redis
     redis_host: str = "localhost"
     redis_port: int = 6379
+    # Redis 密码（生产必须设置——broker 里能注入任意 Celery 任务）
+    redis_password: str = ""
 
     # MinIO
     minio_endpoint: str = "localhost:9000"
@@ -65,6 +67,8 @@ class Settings(BaseSettings):
 
     @property
     def redis_url(self) -> str:
+        if self.redis_password:
+            return f"redis://:{self.redis_password}@{self.redis_host}:{self.redis_port}/0"
         return f"redis://{self.redis_host}:{self.redis_port}/0"
 
 

@@ -189,6 +189,9 @@ def ocr_and_translate(
             from app.services.paddle_ocr import paddleocr_to_text_regions
             regions = paddleocr_to_text_regions(
                 image_bytes, target_lang,
+                # lang 决定识别模型语种——不传则恒为中英模型，
+                # 俄语/阿语等文档的图片会识别成乱码
+                lang=source_lang,
                 source_lang=source_lang, glossary=glossary, tm_lookup=tm_lookup,
             )
             if regions:
@@ -240,6 +243,7 @@ def ocr_image_regions(
             from app.services.paddle_ocr import paddleocr_to_text_regions
             regions = paddleocr_to_text_regions(
                 image_bytes, target_lang,
+                lang=source_lang,
                 source_lang=source_lang, glossary=glossary, tm_lookup=tm_lookup,
             )
             logger.info("PaddleOCR+PP-Structure 识别到 %d 个文字区域", len(regions))

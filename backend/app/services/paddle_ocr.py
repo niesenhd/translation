@@ -53,7 +53,10 @@ from app.services.ocr import TextRegion
 log = logging.getLogger(__name__)
 
 # 引擎单例
-_ocr_engine = None
+# OCR 引擎按 Paddle 语种缓存：不同语种加载不同识别模型。
+# 此前是单个全局单例，第一次初始化的语种"固化"，后续俄语/阿语等
+# 文档的图片仍用中英模型识别，产出乱码。
+_ocr_engines: dict[str, object] = {}
 _structure_engine = None
 _engine_lock = threading.Lock()
 
@@ -108,15 +111,17 @@ def _get_ocr_engine(lang: str = "ch"):
     - 改为 `use_textline_orientation` / `use_doc_orientation_classify`
     - 调用接口为 `predict()`，返回单 dict 含 `rec_texts` / `rec_scores` / `rec_boxes`
     """
-    global _ocr_engine
-    if _ocr_engine is None:
+    paddle_lang = _map_lang(lang)
+    engine = _ocr_engines.get(paddle_lang)
+    if engine is None:
         with _engine_lock:
-            if _ocr_engine is None:  # double-check
+            engine = _ocr_engines.get(paddle_lang)  # double-check
+            if engine is None:
                 _apply_pir_patch()
                 try:
                     from paddleocr import PaddleOCR
-                    _ocr_engine = PaddleOCR(
-                        lang=_map_lang(lang),
+                    engine = PaddleOCR(
+                        lang=paddle_lang,
                         # 关闭文档级方向分类（图像里通常都是正向文字）
                         use_doc_orientation_classify=False,
                         # 关闭文档矫正（普通图片不需要）
@@ -124,14 +129,20 @@ def _get_ocr_engine(lang: str = "ch"):
                         # 开启文字行方向检测（替代旧版 use_angle_cls）
                         use_textline_orientation=True,
                     )
-                    log.info("PaddleOCR 引擎初始化成功 (lang=%s)", lang)
+                    _ocr_engines[paddle_lang] = engine
+                    log.info("PaddleOCR 引擎初始化成功 (lang=%s→%s)", lang, paddle_lang)
                 except ImportError:
                     log.error("PaddleOCR 未安装，请运行: pip install paddleocr paddlepaddle")
                     raise
                 except Exception as e:
+                    # 非中英语种模型可能未随镜像预下载/不受支持——回退中英模型，
+                    # 至少保证拉丁字母/数字可识别，不让整个任务失败
+                    if paddle_lang != "ch":
+                        log.warning("PaddleOCR 语种 %s 初始化失败（%s），回退 ch 模型", paddle_lang, e)
+                        return _get_ocr_engine("zh")
                     log.error("PaddleOCR 初始化失败: %s", e)
                     raise
-    return _ocr_engine
+    return engine
 
 
 def _get_structure_engine(lang: str = "ch"):

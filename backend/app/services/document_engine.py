@@ -184,8 +184,22 @@ def _translate_many(
 # ---------------------- TXT ----------------------
 
 
+def _decode_text_bytes(data: bytes) -> str:
+    """纯文本解码：UTF-8(-sig) → GB18030/GBK → latin-1 兜底。
+
+    此前 TXT/MD 直接 utf-8 + errors="replace"，国内常见的 GBK 编码
+    文件整篇变 U+FFFD 再被"翻译"，原文不可恢复。与 CSV 路径同一条探测链。
+    """
+    for enc in ("utf-8-sig", "utf-8", "gb18030", "gbk"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("latin-1")
+
+
 def translate_txt(data: bytes, translator: Translator, ctx: TranslationContext) -> bytes:
-    text = data.decode("utf-8", errors="replace")
+    text = _decode_text_bytes(data)
     # 按段落（双换行）切分，保留原段落结构
     paragraphs = text.split("\n\n")
     translated = _translate_many(paragraphs, translator, ctx)
@@ -201,7 +215,7 @@ def translate_md(data: bytes, translator: Translator, ctx: TranslationContext) -
     实现：先把内容拆为顺序片段列表，每个片段标记是否需翻译，
     再把需翻译的部分送入并发翻译，最后按原顺序拼回。
     """
-    text = data.decode("utf-8", errors="replace")
+    text = _decode_text_bytes(data)
     lines = text.split("\n")
 
     # 片段：(needs_translate, content)
@@ -249,19 +263,126 @@ def translate_md(data: bytes, translator: Translator, ctx: TranslationContext) -
 
 # ---------------------- DOCX ----------------------
 
+_NS_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_NS_XML = "http://www.w3.org/XML/1998/namespace"
+
+
+def _is_inside_textbox(node, stop) -> bool:
+    """判断节点在 stop 祖先之内是否被 w:txbxContent 包裹。
+
+    文本框内容是嵌套的独立 w:p，由 _collect_docx_xml_paragraphs 单独收集翻译；
+    父段落的提取/写回必须排除它们，否则同一文字会被处理两次。
+    """
+    parent = node.getparent()
+    txbx_tag = f"{{{_NS_W}}}txbxContent"
+    while parent is not None and parent is not stop:
+        if parent.tag == txbx_tag:
+            return True
+        parent = parent.getparent()
+    return False
+
+
+def _paragraph_own_runs(p_elem) -> list:
+    """段落"自有"的全部 run 元素（文档顺序）。
+
+    与 python-docx 的 paragraph.runs 不同：
+    - 包含 w:hyperlink、内联 w:sdt（内容控件）、w:smartTag 等包装元素内的 run
+      —— paragraph.text 会计入这些文字（python-docx>=1.1），但 paragraph.runs
+      不含对应 run，导致写回时清不掉，译文与原文并存
+    - 排除文本框（w:txbxContent）里嵌套段落的 run —— 那是别的段落的内容
+    """
+    return [
+        r for r in p_elem.findall(f".//{{{_NS_W}}}r")
+        if not _is_inside_textbox(r, p_elem)
+    ]
+
+
+def _extract_docx_paragraph_text(paragraph) -> str:
+    """按"自有 run"提取段落文本（替代 paragraph.text）。
+
+    与写回逻辑使用同一 run 集合，保证"提取到的文字都能被写回清理"。
+    """
+    parts = []
+    for r in _paragraph_own_runs(paragraph._p):
+        for t in r.findall(f"{{{_NS_W}}}t"):
+            parts.append(t.text or "")
+    return "".join(parts)
+
+
+def _collect_docx_table_paragraphs(table, items: list, seen_cells: set) -> None:
+    """递归收集表格（含嵌套表格）内的可翻译段落。
+
+    - cell.tables 递归：python-docx 的 doc.tables/cell.paragraphs 都只看直接子级，
+      法律文书常见的嵌套表格此前整体漏翻
+    - 合并单元格去重：row.cells 对合并区域返回同一底层 w:tc 多次，
+      不去重会对同一段落重复调用翻译 API
+    """
+    for row in table.rows:
+        for cell in row.cells:
+            tc_id = id(cell._tc)
+            if tc_id in seen_cells:
+                continue
+            seen_cells.add(tc_id)
+            for paragraph in cell.paragraphs:
+                if _extract_docx_paragraph_text(paragraph).strip():
+                    items.append(paragraph)
+            for nested in cell.tables:
+                _collect_docx_table_paragraphs(nested, items, seen_cells)
+
 
 def _collect_docx_paragraphs(doc: Document) -> list:
-    """收集所有需要翻译的段落对象（含表格内）。"""
+    """收集所有需要翻译的段落对象（含表格及嵌套表格内）。"""
     items: list = []
     for paragraph in doc.paragraphs:
-        if paragraph.text.strip():
+        if _extract_docx_paragraph_text(paragraph).strip():
             items.append(paragraph)
+    seen_cells: set = set()
     for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for paragraph in cell.paragraphs:
-                    if paragraph.text.strip():
-                        items.append(paragraph)
+        _collect_docx_table_paragraphs(table, items, seen_cells)
+    return items
+
+
+def _collect_docx_xml_paragraphs(doc: Document) -> list:
+    """收集 python-docx 对象模型遗漏的段落（以 lxml w:p 元素返回，走 XML 读写路径）：
+
+    - 文本框：w:txbxContent 内的段落（含 mc:Fallback 里 w:pict 的副本，
+      两份都翻译以保证新旧 Word 显示一致）
+    - 内容控件：块级 w:sdt/w:sdtContent 包裹的段落（doc.paragraphs、cell.paragraphs
+      都只看直接子级 w:p，模板类法律文书大量使用内容控件，此前整体漏翻）
+
+    从 body 与各 section 页眉/页脚整棵扫描，天然覆盖任意嵌套位置（表格内的
+    文本框、内容控件内的表格等）。lxml 的 union XPath 返回去重后的节点集，
+    文本框内的内容控件不会被收集两次。
+    """
+    roots = [doc.element.body]
+    for section in doc.sections:
+        for hf in (
+            section.header, section.footer,
+            section.first_page_header, section.first_page_footer,
+            section.even_page_header, section.even_page_footer,
+        ):
+            if hf is None:
+                continue
+            try:
+                if hf.is_linked_to_previous:
+                    continue
+                roots.append(hf._element)
+            except Exception:  # noqa: BLE001
+                continue
+
+    items: list = []
+    seen: set = set()
+    for root in roots:
+        nodes = root.xpath(
+            ".//w:txbxContent//w:p"
+            " | .//w:sdtContent//w:p[not(ancestor::w:txbxContent)]"
+        )
+        for p_elem in nodes:
+            if id(p_elem) in seen:
+                continue
+            seen.add(id(p_elem))
+            if _extract_paragraph_text_from_xml(p_elem).strip():
+                items.append(p_elem)
     return items
 
 
@@ -287,14 +408,11 @@ def _collect_docx_header_footer_paragraphs(doc: Document) -> list:
             except Exception:  # noqa: BLE001
                 pass
             for paragraph in hf.paragraphs:
-                if paragraph.text.strip():
+                if _extract_docx_paragraph_text(paragraph).strip():
                     items.append(paragraph)
+            seen_cells: set = set()
             for table in hf.tables:
-                for row in table.rows:
-                    for cell in row.cells:
-                        for paragraph in cell.paragraphs:
-                            if paragraph.text.strip():
-                                items.append(paragraph)
+                _collect_docx_table_paragraphs(table, items, seen_cells)
     return items
 
 
@@ -329,24 +447,77 @@ def _get_docx_footnote_paragraphs(doc: Document) -> tuple[list, dict]:
 
 
 def _extract_paragraph_text_from_xml(p_elem) -> str:
-    """从 lxml w:p 元素中提取纯文本。"""
-    NS_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-    texts = p_elem.findall(f".//{{{NS_W}}}t")
-    return "".join(t.text or "" for t in texts)
+    """从 lxml w:p 元素中提取纯文本（排除其内嵌文本框里嵌套段落的文字）。"""
+    parts = []
+    for r in _paragraph_own_runs(p_elem):
+        for t in r.findall(f"{{{_NS_W}}}t"):
+            parts.append(t.text or "")
+    return "".join(parts)
+
+
+def _set_w_t_text(t_elem, text: str) -> None:
+    """把文本写入 w:t，换行/制表符转为 w:br / w:tab 兄弟节点。
+
+    直接给 w:t.text 塞 "\\n" Word 只会当普通空白渲染——对照模式
+    "原文\\n译文" 的换行会丢。python-docx 的 run.text setter 会做
+    这个转换，但我们绕开了 setter（它会 clear_content 删光子元素），
+    故在此自行处理。
+    """
+    def _mark_space(t):
+        if t.text and t.text != t.text.strip():
+            t.set(f"{{{_NS_XML}}}space", "preserve")
+
+    if "\n" not in text and "\t" not in text:
+        t_elem.text = text
+        _mark_space(t_elem)
+        return
+
+    tokens = re.split(r"(\n|\t)", text)
+    t_elem.text = tokens[0]
+    _mark_space(t_elem)
+    anchor = t_elem
+    for tok in tokens[1:]:
+        if tok == "\n":
+            node = t_elem.makeelement(f"{{{_NS_W}}}br", {}, None)
+        elif tok == "\t":
+            node = t_elem.makeelement(f"{{{_NS_W}}}tab", {}, None)
+        else:
+            node = t_elem.makeelement(f"{{{_NS_W}}}t", {}, None)
+            node.text = tok
+            _mark_space(node)
+        anchor.addnext(node)
+        anchor = node
 
 
 def _write_text_to_xml_paragraph(p_elem, new_text: str) -> None:
     """把翻译后的文本写回 lxml w:p 元素。
 
-    策略：找到所有 w:t 子节点，把文本写入第一个，其余清空。
+    策略：在"自有 run"中跳过不可覆盖的 run（脚注回指标记、字段、图片等），
+    把译文写入第一个含 w:t 的普通 run，其余普通 run 的 w:t 清空。
     """
-    NS_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-    t_nodes = p_elem.findall(f".//{{{NS_W}}}t")
-    if not t_nodes:
+    target_t = None
+    target_r = None
+    cleared_runs = []
+    for r in _paragraph_own_runs(p_elem):
+        if _element_is_preservable(r):
+            continue
+        for t in r.findall(f"{{{_NS_W}}}t"):
+            if target_t is None:
+                target_t = t
+                target_r = r
+            else:
+                t.text = ""
+        if r is not target_r:
+            cleared_runs.append(r)
+    if target_t is None:
         return
-    t_nodes[0].text = new_text
-    for t in t_nodes[1:]:
-        t.text = ""
+    _set_w_t_text(target_t, new_text)
+    # 被清空的 run 里残留的制表符/换行也一并移除，
+    # 否则译文旁会留下原版式的杂散 tab/断行
+    for r in cleared_runs:
+        for tag in ("tab", "br", "cr"):
+            for node in r.findall(f"{{{_NS_W}}}{tag}"):
+                r.remove(node)
 
 
 def _run_has_drawing(run) -> bool:
@@ -364,43 +535,48 @@ def _run_has_drawing(run) -> bool:
     )
 
 
-def _run_is_preservable(run) -> bool:
-    """判断 run 是否必须原样保留（绝不可被 run.text= 覆盖或清空）。
+# run 内出现下列元素之一即"不可覆盖"：
+# - 图片 / 嵌入对象 / 公式：drawing / pict / object
+# - 脚注 / 尾注引用标记：footnoteReference / endnoteReference（正文里指向脚注的
+#   小标记）及 footnoteRef / endnoteRef（脚注文本内的回指标记）——一旦丢失，
+#   脚注虽仍在 footnotes.xml 中但正文无引用，Word 不再显示，表现为
+#   "译文只有一部分"（脚注占比大的法律文书尤其明显）
+# - 字段：fldChar / instrText（页码、目录、交叉引用等），清空会破坏字段
+_PRESERVABLE_DESCENDANTS = tuple(
+    f".//{{{_NS_W}}}{tag}"
+    for tag in (
+        "drawing", "pict", "object",
+        "footnoteReference", "endnoteReference",
+        "footnoteRef", "endnoteRef",
+        "fldChar", "instrText",
+    )
+)
 
-    `run.text` 的 setter 会先调用 clear_content() 删除 run 内**所有**子元素，
-    因此凡含以下特殊元素的 run 都必须跳过，否则内容会丢失：
-    - 图片 / 嵌入对象 / 公式：w:drawing / w:pict / w:object
-    - 脚注 / 尾注引用标记：w:footnoteReference / w:endnoteReference（正文里指向脚注的小标记）
-      及 w:footnoteRef / w:endnoteRef（脚注文本内的回指标记）——
-      一旦丢失，脚注虽仍在 footnotes.xml 中但正文无引用，Word 不再显示，
-      表现为"译文只有一部分"（脚注占比大的法律文书尤其明显）。
-    - 字段：w:fldChar / w:instrText（页码、目录、交叉引用等），清空会破坏字段。
+
+def _element_is_preservable(r_elem) -> bool:
+    """判断 run 元素是否必须原样保留（绝不可清空其 w:t）。
+
+    用 findall 而非带前缀的 xpath，兼容 python-docx oxml 元素与
+    etree.fromstring 解析出的原生 lxml 元素（脚注/尾注路径）。
     """
-    el = run._element
-    return bool(el.xpath(
-        ".//w:drawing | .//w:pict | .//w:object | "
-        ".//w:footnoteReference | .//w:endnoteReference | "
-        ".//w:footnoteRef | .//w:endnoteRef | "
-        ".//w:fldChar | .//w:instrText"
-    ))
+    return any(r_elem.find(path) is not None for path in _PRESERVABLE_DESCENDANTS)
+
+
+def _run_is_preservable(run) -> bool:
+    """python-docx Run 对象版本的不可覆盖判断。"""
+    return _element_is_preservable(run._element)
 
 
 def _write_translated_to_paragraph(paragraph, new_text: str) -> None:
-    """把翻译后的文本写回段落，保留其中的图片/嵌入对象。
+    """把翻译后的文本写回段落，保留其中的图片/嵌入对象/脚注引用/字段。
 
-    策略：
-    - 只把整段译文写入第一个"普通文本 run"，保留其字体格式
-    - 其他"普通文本 run"清空文本（不会破坏其格式）
-    - 不可覆盖的 run（图片/脚注引用/字段等）完全不动，避免内容丢失
-    - 段落里完全没有普通文本 run（只有图片/脚注引用）时不做任何修改
+    基于"自有 run"集合（含超链接、内联内容控件里的 run）在 XML 层写回：
+    - 整段译文写入第一个含 w:t 的普通 run（保留其字体格式），其余普通 run 的
+      w:t 清空——含超链接内的文字，否则译文与链接原文并存（重复内容）
+    - 不可覆盖的 run（图片/脚注引用/字段等）完全不动
+    - 不用 run.text= setter：它会 clear_content() 删光 run 子元素
     """
-    runs = list(paragraph.runs)
-    text_runs = [r for r in runs if not _run_is_preservable(r)]
-    if not text_runs:
-        return  # 无可写入的普通文本 run（只有图片/脚注引用等），保持原样
-    text_runs[0].text = new_text
-    for r in text_runs[1:]:
-        r.text = ""
+    _write_text_to_xml_paragraph(paragraph._p, new_text)
 
 
 def _translate_docx_inplace(doc: Document, translator: Translator, ctx: TranslationContext) -> None:
@@ -409,20 +585,21 @@ def _translate_docx_inplace(doc: Document, translator: Translator, ctx: Translat
     注意：_translate_many 返回的字符串已经按 ctx.output_mode 处理过对照逻辑，
     这里直接写回即可，不要再次调用 _bilingual_join。
     """
-    # 正文段落（含表格内）+ 页眉/页脚段落（两者都是普通 python-docx 段落，
-    # 走 .text + _write_translated_to_paragraph 同一套写回逻辑）
+    # 正文段落（含表格及嵌套表格内）+ 页眉/页脚段落（普通 python-docx 段落）
     paragraphs = _collect_docx_paragraphs(doc) + _collect_docx_header_footer_paragraphs(doc)
-    # 脚注 + 尾注段落
+    # 文本框/内容控件段落（lxml w:p 元素）+ 脚注/尾注段落
+    xml_paragraphs = _collect_docx_xml_paragraphs(doc)
     fn_paragraphs, fn_roots_map = _get_docx_footnote_paragraphs(doc)
-    all_paragraphs = paragraphs + fn_paragraphs
+    all_paragraphs = paragraphs + xml_paragraphs + fn_paragraphs
 
     if not all_paragraphs:
         return
-    # 正文段落用 .text，脚注段落用 XML 提取
+    # 正文段落按"自有 run"提取（含超链接/内联内容控件文字、不含文本框嵌套段落），
+    # 文本框/内容控件/脚注段落用 XML 提取
     texts = []
     for i, p in enumerate(all_paragraphs):
         if i < len(paragraphs):
-            texts.append(p.text)
+            texts.append(_extract_docx_paragraph_text(p))
         else:
             texts.append(_extract_paragraph_text_from_xml(p))
     translated = _translate_many(texts, translator, ctx)
@@ -1255,6 +1432,54 @@ def _replace_pptx_images(prs, ctx: TranslationContext) -> None:
         logger.info("PPT 共替换 %d 张图片", replaced_count)
 
 
+def _collect_pptx_diagram_parts(prs) -> list:
+    """收集 SmartArt 相关的 XML part。
+
+    SmartArt 文字不在幻灯片 XML 里（graphicFrame 中无 a:t），而在独立的
+    diagram part：``ppt/diagrams/dataN.xml``（数据源）。PowerPoint 还会把
+    渲染结果缓存在 ``ppt/diagrams/drawingN.xml``（经 data part 的扩展关系
+    引用），打开文件时优先用缓存显示——两处都要翻译，否则界面上仍是原文。
+    """
+    parts: list = []
+    seen: set = set()
+
+    def _add(part) -> None:
+        name = str(part.partname)
+        if name in seen:
+            return
+        if "/diagrams/data" not in name and "/diagrams/drawing" not in name:
+            return
+        seen.add(name)
+        parts.append(part)
+
+    owners = []
+    for master in prs.slide_masters:
+        owners.append(master.part)
+        for layout in master.slide_layouts:
+            owners.append(layout.part)
+    for slide in prs.slides:
+        owners.append(slide.part)
+
+    for owner in owners:
+        try:
+            rels = list(owner.rels.values())
+        except Exception:  # noqa: BLE001
+            continue
+        for rel in rels:
+            if rel.is_external:
+                continue
+            tp = rel.target_part
+            _add(tp)
+            # data part 通过自身关系引用 drawing part（显示缓存）
+            try:
+                for rel2 in tp.rels.values():
+                    if not rel2.is_external:
+                        _add(rel2.target_part)
+            except Exception:  # noqa: BLE001
+                continue
+    return parts
+
+
 def translate_pptx(data: bytes, translator: Translator, ctx: TranslationContext) -> bytes:
     """PPT (.pptx) 翻译。
 
@@ -1299,10 +1524,10 @@ def translate_pptx(data: bytes, translator: Translator, ctx: TranslationContext)
             for p in shape.text_frame.paragraphs:
                 paragraphs.append(p)
             return
-        # SmartArt：python-pptx 不直接支持，扫描底层 XML 的 a:t 元素
+        # 其它 graphicFrame（如 SmartArt 占位）：幻灯片 XML 里若有零散 a:t 也一并收
+        # （真正的 SmartArt 文字在独立 diagram part，见下方 _collect_pptx_diagram_parts）
         try:
             element = shape._element
-            # SmartArt 数据图引用：通过命名空间找 a:t
             ns = {"a": "http://schemas.openxmlformats.org/drawingml/2006/main"}
             for t_elem in element.findall(".//a:t", ns):
                 smartart_text_elements.append(t_elem)
@@ -1326,6 +1551,24 @@ def translate_pptx(data: bytes, translator: Translator, ctx: TranslationContext)
         if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
             for p in slide.notes_slide.notes_text_frame.paragraphs:
                 paragraphs.append(p)
+
+    # 2.5 SmartArt：文字在独立 diagram part（data/drawing），逐 part 解析 a:t。
+    # 非 XmlPart（python-pptx 未注册的 part 类型）需在保存前把改动序列化回 _blob。
+    from lxml import etree as _etree
+
+    _NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    _opaque_diagram_parts: list = []  # (part, root)，写回时序列化
+    for dpart in _collect_pptx_diagram_parts(prs):
+        try:
+            if hasattr(dpart, "_element"):
+                root = dpart._element
+            else:
+                root = _etree.fromstring(dpart.blob)
+                _opaque_diagram_parts.append((dpart, root))
+            for t_elem in root.findall(f".//{{{_NS_A}}}t"):
+                smartart_text_elements.append(t_elem)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SmartArt part %s 解析失败，跳过：%s", dpart.partname, exc)
 
     # 准备翻译列表
     para_texts: list[str] = []
@@ -1360,6 +1603,16 @@ def translate_pptx(data: bytes, translator: Translator, ctx: TranslationContext)
     for t_elem, new_text in zip(smartart_text_elements, smart_translated):
         if new_text:
             t_elem.text = new_text
+
+    # 非 XmlPart 的 diagram part：把修改后的 XML 序列化回 part 内容，
+    # 否则 prs.save 仍写出原始 blob，SmartArt 译文丢失
+    for dpart, root in _opaque_diagram_parts:
+        try:
+            dpart._blob = _etree.tostring(
+                root, xml_declaration=True, encoding="UTF-8", standalone=True
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SmartArt part %s 写回失败：%s", dpart.partname, exc)
 
     # P1.3：图片 OCR + 就地替换文字
     _replace_pptx_images(prs, ctx)

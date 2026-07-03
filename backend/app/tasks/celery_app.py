@@ -12,7 +12,7 @@ import time
 
 from celery import Celery
 from celery.schedules import crontab
-from sqlalchemy import text
+from sqlalchemy import text, update
 
 from app.core.config import get_settings
 from app.core.database import SessionLocal
@@ -221,9 +221,23 @@ def run_translation_task(self, task_id: str) -> None:  # noqa: ARG001
         _acquire_concurrency_slot(task_id)
         slot_acquired = True
 
-        task.status = TaskStatus.RUNNING
-        task.progress = 10
+        # 条件更新"抢占"任务：仅 QUEUED 状态可转 RUNNING。
+        # 两个作用：1) 任务在等槽位期间被删除时不会把 DELETED 覆写回 RUNNING;
+        # 2) 同一任务被重复入队（如并发 retry）时只有一个 worker 能抢到，
+        #    另一个在此退出，不会双份翻译。
+        claimed = db.execute(
+            update(TranslationTask)
+            .where(
+                TranslationTask.id == task_id,
+                TranslationTask.status == TaskStatus.QUEUED,
+            )
+            .values(status=TaskStatus.RUNNING, progress=10)
+        )
         db.commit()
+        if claimed.rowcount != 1:
+            logger.info("任务 %s 状态已非 QUEUED（已删除或已被其它 worker 抢占），跳过", task_id)
+            return
+        db.refresh(task)
 
         source_bytes = download_bytes(task.source_object)
 
@@ -301,13 +315,37 @@ def run_translation_task(self, task_id: str) -> None:  # noqa: ARG001
         task.progress = 90
         db.commit()
 
+        # 上传译文前最后确认一次任务未被删除，缩小竞态窗口
+        _check_task_alive(task_id)
+
         result_object = f"results/{task.id}.{out_ext}"
         upload_bytes(result_object, result_bytes)
 
-        task.result_object = result_object
-        task.status = TaskStatus.SUCCEEDED
-        task.progress = 100
+        # 条件更新收尾：仅 RUNNING 状态可转 SUCCEEDED。
+        # 若用户在"最后一次存活检查 → 此处提交"之间删除了任务，rowcount=0，
+        # 此时必须把刚上传的译文清掉——否则用户已"安全删除"的法律文档译文
+        # 会重新出现在 MinIO 并永久残留。
+        finished = db.execute(
+            update(TranslationTask)
+            .where(
+                TranslationTask.id == task_id,
+                TranslationTask.status == TaskStatus.RUNNING,
+            )
+            .values(
+                result_object=result_object,
+                status=TaskStatus.SUCCEEDED,
+                progress=100,
+            )
+        )
         db.commit()
+        if finished.rowcount != 1:
+            logger.info("任务 %s 在收尾前被删除，清理已上传的译文对象", task_id)
+            from app.core.storage import secure_remove_object
+            try:
+                secure_remove_object(result_object)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("清理译文对象 %s 失败：%s", result_object, exc)
+            return
     except TaskCancelled as exc:
         # 任务已删除：不修改状态（保持 DELETED），不重试，安静退出
         try:
@@ -317,14 +355,25 @@ def run_translation_task(self, task_id: str) -> None:  # noqa: ARG001
         return
     except Exception as exc:  # noqa: BLE001
         db.rollback()
-        task = db.get(TranslationTask, task_id)
-        if task is not None:
-            # 若任务在执行期间被删除，不要把状态改成 FAILED
-            if task.status == TaskStatus.DELETED:
-                return
-            task.status = TaskStatus.FAILED
-            task.error_message = _humanize_error(exc)[:1000]
+        # 条件更新：仅 QUEUED/RUNNING 可转 FAILED——已删除的任务保持 DELETED，
+        # 已被其它流程收尾的任务也不会被覆写（检查+赋值的旧写法存在竞态）。
+        try:
+            db.execute(
+                update(TranslationTask)
+                .where(
+                    TranslationTask.id == task_id,
+                    TranslationTask.status.in_(
+                        [TaskStatus.QUEUED, TaskStatus.RUNNING]
+                    ),
+                )
+                .values(
+                    status=TaskStatus.FAILED,
+                    error_message=_humanize_error(exc)[:1000],
+                )
+            )
             db.commit()
+        except Exception:  # noqa: BLE001
+            db.rollback()
         # 不再 raise：max_retries=0 已禁用重试，且抛异常会导致日志混乱
         return
     finally:
