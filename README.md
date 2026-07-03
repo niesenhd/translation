@@ -52,6 +52,32 @@ translation/
 
 ## 维护变更记录
 
+### 2026-07-03（第二批：数据安全 / 第三批：翻译覆盖，commit 407cc13）
+**批2 数据安全：**
+- **任务状态机条件更新**：worker 抢占（QUEUED→RUNNING）、收尾（RUNNING→SUCCEEDED/FAILED）
+  全部改为带 WHERE 条件的原子 UPDATE。修复两个竞态：① 用户删除任务后 worker 无条件覆写
+  状态导致"已安全删除的译文复活重新上传 MinIO 且永久残留"；② 并发 retry 重复入队导致
+  同一任务被两个 worker 双份翻译（双倍 LLM 消耗）。收尾发现任务已删除时自动清理刚上传的
+  译文对象；上传前增加存活复查。retry 接口同样条件抢占（冲突返回 409）；broker 不可用时
+  上传/重试任务标 FAILED 而非永久卡"排队中"。
+- **端口暴露收敛**：postgres/redis/minio/backend 全部改绑 127.0.0.1（此前 0.0.0.0 内网
+  任意主机可直连数据库/队列/对象存储）。对外仅保留前端 8080。运维需要时在服务器本机
+  localhost 访问或 SSH 隧道。
+- **Redis 加固**：加 requirepass（密码在服务器 deploy/.env 的 REDIS_PASSWORD，不入 git）+
+  appendonly 持久化 + 数据卷。修复"Redis 重启后已入队消息全丢、任务永卡排队中"。
+**批3 翻译覆盖（法律文书常用结构此前整体漏翻）：**
+- **DOCX**：嵌套表格递归收集；合并单元格按底层 tc 去重（不再重复翻译计费）；文本框
+  （w:txbxContent，含 mc:Fallback 副本）与块级内容控件（w:sdtContent）段落纳入翻译；
+  超链接/内联控件文字纳入统一"自有 run"提取+写回——修复"译文与超链接原文并存"；
+  写回绕开 python-docx run.text= 的 clear_content，换行/制表符正确转 w:br/w:tab。
+  NVCA 回归：脚注引用 17→17，页脚正常翻译。
+- **PPTX SmartArt**：文字实际存于独立 diagram part（data/drawing.xml），此前扫幻灯片 XML
+  永远扫不到，SmartArt 整体漏翻；现逐 part 解析 a:t 翻译并序列化写回。
+- **TXT/MD 编码**：GBK/GB18030 自动探测（与 CSV 同链），修复"GBK 文件整篇变 � 再被翻译"。
+- **图片 OCR 语种**：source_lang 真正传入 PaddleOCR（此前恒用中英模型，俄/阿语图片出乱码）；
+  引擎按语种缓存；语种模型初始化失败自动回退中英模型。
+- 新增 `scripts/test_batch23.py` 离线回归（16 项断言，假翻译器零 API 消耗）。
+
 ### 2026-07-02（译文正确性修复,第一批）
 - **TM 高相似盲替换修复**：原逻辑相似度 ≥95% 直接套用历史译文。bigram Dice 对长段落
   不敏感——仅一个日期/金额/当事人名不同时相似度仍 >0.95，会把旧文书的事实性内容写进
