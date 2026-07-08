@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import logging
 import re
 import threading
 
@@ -13,6 +14,8 @@ from openai import APIError, APITimeoutError, BadRequestError, RateLimitError
 import time
 
 from app.core.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
     "You are a senior legal translator for a law firm, specializing in Chinese-English legal document translation.\n"
@@ -246,9 +249,16 @@ class DashScopeTranslator(Translator):
             tm_section = f"\n\nREFERENCE TRANSLATION (similar text, for reference only, adjust as needed):\n\"{tm_reference}\""
 
         last_err: Exception | None = None
+        budget_override: int | None = None  # 译文被截断时临时放大 max_tokens 重试一次
         # 重试 6 次，覆盖瞬时网络错误 + 限流。429 时退避更激进。
         for attempt in range(6):
             try:
+                # 显式 max_tokens：不设则走 DashScope 偏小的默认值，长段落译文被
+                # 中途截断（NVCA 实测多段砍到半句）。按输入长度给足预算，封顶 8192。
+                # token 估算：CJK 约 1 字符=1 token，拉丁约 4 字符=1 token，
+                # 取 len/2 是对混合文本的稳妥上估；×3 留出译文(≤2x 原文)余量。
+                est_tokens = max(256, len(text) // 2)
+                max_tokens = budget_override or min(8192, max(2048, est_tokens * 3))
                 completion = self._client.chat.completions.create(
                     model=self._model,
                     messages=[
@@ -256,11 +266,32 @@ class DashScopeTranslator(Translator):
                         {"role": "user", "content": text},
                     ],
                     temperature=0.2,
+                    max_tokens=max_tokens,
                     # 关闭思维链：翻译是直接生成任务，无需 reasoning，
                     # 关闭后单次调用的 latency 与输出 token 显著减少。
                     extra_body={"enable_thinking": False},
                 )
-                return completion.choices[0].message.content or ""
+                choice = completion.choices[0]
+                content = (choice.message.content or "").strip()
+                finish = getattr(choice, "finish_reason", None)
+
+                # 截断检测：finish_reason=length 表示输出被 max_tokens 砍断。
+                # 首次截断 → 放大到 8192 重试一次；仍截断(极长单段) → 返回部分译文并告警
+                # （部分 > 无，由上层 _translate_text 兜底；非空故不会误判为漏翻）
+                if finish == "length" and budget_override is None:
+                    budget_override = 8192
+                    time.sleep(0.3)
+                    continue
+                if finish == "length":
+                    logger.warning("译文在 max_tokens=8192 下仍被截断(段过长)，返回部分译文：%.60s", text)
+
+                # 空译文：偶发(模型返回空 content)。重试，仍空则交给上层兜底保留原文
+                if not content:
+                    last_err = RuntimeError("模型返回空译文")
+                    time.sleep(min(1 + 2 * attempt, 30))
+                    continue
+
+                return content
             except BadRequestError as exc:
                 # 400 Bad Request：重试也无用（多半是 prompt 过长 / 内容触发安全过滤）。
                 # 立即抛出 ContentRejectedError，由上层把该段保留原文，不阻塞整体任务，也不计入熔断。
