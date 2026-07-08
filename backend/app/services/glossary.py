@@ -26,85 +26,35 @@ def get_glossary_for_lang_pair(source_lang: str, target_lang: str) -> list[dict]
 
     返回格式：[{"source_term": ..., "target_term": ..., "priority": ...}, ...]
 
-    当 source_lang="auto" 时：
-    - 正向匹配：加载所有以 `→{tgt}` 结尾的条目（如 zh→en、fr→en 都会命中）
-    - 反向匹配：加载所有以 `{tgt}→` 开头的条目，source/target 互换
+    只按真实方向正向加载，**不做反向匹配**。早期实现会把反方向（如 zh→en）的整本
+    词典 source/target 互换后当作本方向（en→zh）术语注入——这会塞进数万条词典式
+    反向释义（如某 zh→en 条目反向成 "transaction→和息"、"terms→开庭期"），系统性
+    把模型带偏，是译文质量劣化的主因（律师反馈"翻译水平低"的根因）。术语库本质是
+    方向性的，跨方向复用应靠人工按方向录入，而非自动反向。
     """
     src = _normalize_lang(source_lang)
     tgt = _normalize_lang(target_lang)
 
     db = SessionLocal()
     try:
-        if src == "auto" or not src:
-            # 自动检测源语言：无法精确匹配方向，加载所有目标语种相关的条目
-            forward_pattern = f"%→{tgt}"
-            reverse_pattern = f"{tgt}→%"
-
-            # 正向条目（lang_pair 以 →{tgt} 结尾）
-            forward_entries = list(db.scalars(
-                select(TermEntry).where(TermEntry.lang_pair.like(forward_pattern))
+        if src and src != "auto":
+            # 已知源语言：仅加载精确方向（如 en→zh）
+            entries = list(db.scalars(
+                select(TermEntry).where(TermEntry.lang_pair == f"{src}→{tgt}")
             ))
-            # 反向条目（lang_pair 以 {tgt}→ 开头），source/target 互换
-            reverse_entries = list(db.scalars(
-                select(TermEntry).where(TermEntry.lang_pair.like(reverse_pattern))
+        else:
+            # auto 源语言：源文语种未知，但译文语种确定，加载所有以 →{tgt} 结尾的
+            # 正向条目（源语种不限，但方向正确：源文 → 目标译文语种）
+            entries = list(db.scalars(
+                select(TermEntry).where(TermEntry.lang_pair.like(f"%→{tgt}"))
             ))
-
-            result = [
-                {
-                    "source_term": e.source_term,
-                    "target_term": e.target_term,
-                    "priority": e.priority.value,
-                }
-                for e in forward_entries
-            ]
-            result.extend([
-                {
-                    "source_term": e.target_term,
-                    "target_term": e.source_term,
-                    "priority": e.priority.value,
-                }
-                for e in reverse_entries
-            ])
-            return result
-
-        # 已知源语言：精确方向匹配 + 反向匹配 + 通配
-        lang_pair = f"{src}→{tgt}"
-        reverse_pair = f"{tgt}→{src}"
-
-        # 1. 正向匹配
-        entries = list(db.scalars(
-            select(TermEntry).where(TermEntry.lang_pair == lang_pair)
-        ))
-        # 2. 反向匹配：把反向 lang_pair 的 source/target 互换后加入
-        reverse_entries = list(db.scalars(
-            select(TermEntry).where(TermEntry.lang_pair == reverse_pair)
-        ))
-        # 3. 也加载无语种方向限制的术语（lang_pair 为空或包含通配符）
-        wildcard_entries = list(db.scalars(
-            select(TermEntry).where(
-                TermEntry.lang_pair.like(f"%→{tgt}%"),
-                TermEntry.lang_pair != lang_pair,
-                TermEntry.lang_pair != reverse_pair,
-            )
-        ))
-
-        result = [
+        return [
             {
                 "source_term": e.source_term,
                 "target_term": e.target_term,
                 "priority": e.priority.value,
             }
-            for e in entries + wildcard_entries
+            for e in entries
         ]
-        # 反向条目互换 source/target
-        result.extend([
-            {
-                "source_term": e.target_term,
-                "target_term": e.source_term,
-                "priority": e.priority.value,
-            }
-            for e in reverse_entries
-        ])
-        return result
     finally:
         db.close()
