@@ -52,18 +52,30 @@ translation/
 
 ## 维护变更记录
 
-### 2026-07-08（翻译质量治理：术语库清理 + 截断修复，commit bd59c7e）
-针对律师反馈"翻译水平低"，诊断发现根因是 6-23/6-28 导入的 7.2 万条**法律词典被当作术语库**，
-系统性污染译文（词典给的是单词单一义项，强制注入后逼模型选错义项）。
-- **术语库治理**：72537 → 68498，删除 4039 条高频误配源——en→zh 单个英文头词 3767
-  （court→议会、execute→履行、qualified→附条件的、enforceable→可执行、demonstrate→表演、
-  delivery→交出，这些正是 NVCA 译文劣化的真凶）、单字中文源 244、词典式词性标注 13、
-  乱码 18。保留全部多词法律术语 + 494 条带具体领域标签的精选术语。删除前已做全量备份
-  （服务器 `~/backups/term_entries_pre_cleanup_202607081457.sql`）。
-- **译文截断修复**：translator 显式设置 max_tokens（按输入长度给足，封顶 8192）——此前不设
-  走 DashScope 偏小默认值，长段落译文被中途截断（NVCA 多段砍到半句）；新增 finish_reason=length
-  检测，首次截断放大到 8192 重试一次，仍截断告警并返回部分译文；空译文重试兜底。
-  **该修复模型无关**（max_tokens/finish_reason 为 OpenAI 标准字段），将来切换自部署模型同样适用。
+### 2026-07-08（翻译质量治理：定位并修复译文劣化主因）
+
+针对律师反馈"翻译水平低"，逐层定位到三个独立问题并全部修复。**根因是术语库加载逻辑**，
+而非模型能力（qwen3.6-27b 裸翻法律文本质量良好）。
+
+- **🔴 根因修复（glossary.py，commit b688cec）**：`get_glossary_for_lang_pair` 此前做 en→zh
+  翻译时，会把**整本 5.4 万条 zh→en 词典 source/target 互换后当作 en→zh 术语注入**，塞进数万条
+  词典式反向释义（某 zh→en 条目反向成 `transaction→和息`、`terms→开庭期`、`valid→作准`、
+  `ITS→进口报表制度`），系统性把模型带偏，产出"和息文件 / 开庭期 / 交货"等劣化译文。改为
+  **只按真实方向正向加载**（auto 时按 `→{tgt}` 结尾正向），不做反向匹配、不做跨语种通配。
+  auto→zh 加载量 68498→14286。实测原劣化段译文现已正确（"交易文件…根据其条款…签署并交付"）。
+- **术语库治理（DB，commit bd59c7e）**：72537 → 68498，删除 4039 条高频误配源——en→zh 单个英文
+  头词 3767（court→议会、execute→履行、qualified→附条件的、enforceable→可执行、demonstrate→表演、
+  delivery→交出）、单字中文源 244、词典式词性标注 13、乱码 18。保留多词法律术语 + 494 条精选。
+  全量备份：服务器 `~/backups/term_entries_pre_cleanup_202607081457.sql`。
+- **译文截断修复（translator.py，commit bd59c7e，模型无关）**：显式 max_tokens（按输入长度给足，
+  封顶 8192）——不设走 DashScope 偏小默认值，长段落译文被中途截断（NVCA 多段砍到半句）；
+  finish_reason=length 检测放大重试；空译文重试兜底。该修复对自部署模型同样适用。
+
+> **关于私有化部署 / 数据保密**：当前翻译走 DashScope 云端 API。model_configs 本就支持任意
+> OpenAI 兼容端点（api_base_url + api_key + model_id）。正式应用若要求数据不出内网，可在律所
+> 内网 GPU 服务器上用 vLLM 部署开源翻译模型 **Hunyuan-MT-7B / HY-MT1.5-7B**（腾讯开源，WMT25 冠军，
+> 支持术语干预），在管理后台新增一条模型配置指向本地 vLLM 端点即可，无需改代码。Qwen-MT 翻译
+> 质量好但属 DashScope 纯云端服务、不开源，仅适合用免费额度做 A/B 基准，**不能**作为保密场景生产模型。
 
 > **关于私有化部署 / 数据保密**：当前翻译走 DashScope 云端 API。模型配置（model_configs）
 > 本就支持任意 OpenAI 兼容端点（api_base_url + api_key + model_id）。正式应用若要求
