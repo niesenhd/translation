@@ -501,11 +501,37 @@ def _set_w_t_text(t_elem, text: str) -> None:
         anchor = node
 
 
+def _append_gray_run(anchor_r, text: str) -> None:
+    """在 anchor_r 之后插入一个"灰色+斜体"的新 run，含换行 + 译文文本。
+
+    用于双语对照模式：原文保留在原 run（黑色、原格式），译文单独成段并加灰斜体，
+    视觉上与原文明显区分（需求 2.3）。避免长段落/长脚注里英文原文块在前、
+    中文译文跟在后却不够醒目，被误认为"没有翻译"。
+    """
+    W = _NS_W
+    new_r = anchor_r.makeelement(f"{{{W}}}r", {}, None)
+    rpr = anchor_r.makeelement(f"{{{W}}}rPr", {}, None)
+    rpr.append(anchor_r.makeelement(f"{{{W}}}i", {}, None))            # 斜体
+    color = anchor_r.makeelement(f"{{{W}}}color", {f"{{{W}}}val": "808080"}, None)  # 灰色
+    rpr.append(color)
+    new_r.append(rpr)
+    new_r.append(anchor_r.makeelement(f"{{{W}}}br", {}, None))         # 换行
+    t = anchor_r.makeelement(f"{{{W}}}t", {}, None)
+    t.text = text
+    if text != text.strip():
+        t.set(f"{{{_NS_XML}}}space", "preserve")
+    new_r.append(t)
+    anchor_r.addnext(new_r)
+
+
 def _write_text_to_xml_paragraph(p_elem, new_text: str) -> None:
     """把翻译后的文本写回 lxml w:p 元素。
 
     策略：在"自有 run"中跳过不可覆盖的 run（脚注回指标记、字段、图片等），
     把译文写入第一个含 w:t 的普通 run，其余普通 run 的 w:t 清空。
+
+    双语对照（new_text 含 \\n，即"原文\\n译文"）：原文写入原 run 保留原格式，
+    译文写入新建的灰色斜体 run（_append_gray_run），与原文视觉区分。
     """
     target_t = None
     target_r = None
@@ -523,7 +549,15 @@ def _write_text_to_xml_paragraph(p_elem, new_text: str) -> None:
             cleared_runs.append(r)
     if target_t is None:
         return
-    _set_w_t_text(target_t, new_text)
+    if "\n" in new_text:
+        # 双语对照：原文留原 run，译文进灰色斜体新 run
+        primary, secondary = new_text.split("\n", 1)
+        secondary = secondary.replace("\n", " ").strip()
+        _set_w_t_text(target_t, primary)
+        if secondary:
+            _append_gray_run(target_r, secondary)
+    else:
+        _set_w_t_text(target_t, new_text)
     # 被清空的 run 里残留的制表符/换行也一并移除，
     # 否则译文旁会留下原版式的杂散 tab/断行
     for r in cleared_runs:
