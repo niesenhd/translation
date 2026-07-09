@@ -21,9 +21,10 @@
       <el-table-column prop="original_filename" label="文件" min-width="200" />
       <el-table-column prop="file_ext" label="格式" width="80" />
       <el-table-column prop="target_lang" label="目标语种" width="100" />
-      <el-table-column label="模式" width="100">
+      <el-table-column label="模式" width="130">
         <template #default="{ row }">
-          {{ row.output_mode === 'plain' ? '纯译文' : '中外对照' }}
+          {{ row.output_mode === 'plain' ? '纯译文' : '双语对照' }}
+          <el-tag v-if="row.refine_mode === 'double_pass'" size="small" type="warning" effect="plain" style="margin-left: 4px">精译</el-tag>
         </template>
       </el-table-column>
       <el-table-column label="状态" width="200">
@@ -108,7 +109,7 @@
       <el-form-item label="输出模式">
         <el-radio-group v-model="form.output_mode">
           <el-radio value="plain">纯译文</el-radio>
-          <el-radio value="bilingual">中外对照</el-radio>
+          <el-radio value="bilingual">双语对照</el-radio>
         </el-radio-group>
       </el-form-item>
       <el-form-item v-if="isPdf" label="PDF 输出">

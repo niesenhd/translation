@@ -330,15 +330,19 @@ class DashScopeTranslator(Translator):
         不影响主翻译流程。
         """
         target_name = resolve_language_name(target_lang)
+        # 注意：prompt 含 JSON 示例的字面花括号 {"source":...}，不能用 str.format（会被
+        # 当作占位符触发 KeyError）。改用字符串拼接。
         prompt = (
             "You are a legal terminology extractor. From the SOURCE TEXT, extract the terms "
             "that MUST be translated consistently throughout a document: defined terms "
             "(often capitalized or quoted), legal terms of art, and important proper nouns "
             "/ entity names / recurring key phrases.\n"
-            "For each term give its translation into {tgt}. Output ONLY a JSON array, no prose. "
-            "Format: [{\"source\": \"...\", \"target\": \"...\"}]. Limit to the ~25 most important.\n\n"
-            "SOURCE TEXT:\n{src}"
-        ).format(tgt=target_name, src=source_text[:8000])
+            "For each term give its translation into " + target_name + ". "
+            'Output ONLY a JSON array, no prose. '
+            'Format: [{"source": "...", "target": "..."}]. '
+            "Limit to the ~25 most important.\n\n"
+            "SOURCE TEXT:\n" + source_text[:8000]
+        )
         try:
             completion = self._client.chat.completions.create(
                 model=self._model,
