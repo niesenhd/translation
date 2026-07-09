@@ -2,7 +2,7 @@
   <div style="max-width: 420px; margin: 80px auto">
     <el-card>
       <h2 style="margin-top: 0">登录</h2>
-      <el-form @submit.prevent="onSubmit">
+      <el-form label-width="70px" @submit.prevent="onSubmit">
         <el-form-item label="用户名">
           <el-input v-model="username" placeholder="请输入用户名" />
         </el-form-item>
