@@ -25,6 +25,8 @@ class TranslationMemory(Base):
     source: Mapped[str] = mapped_column(String(32), default="manual")
     # 领域标签
     domain: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # 来源任务（从任务导入时记录，便于追溯/重导），nullable
+    task_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

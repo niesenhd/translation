@@ -3,7 +3,7 @@
     <el-header style="display: flex; align-items: center; justify-content: space-between; background: #1f2d3d; color: #fff">
       <div style="font-size: 18px; font-weight: 600">法律文档翻译系统</div>
       <div style="display: flex; align-items: center; gap: 12px">
-        <router-link v-if="auth.token && auth.username === 'admin'" to="/admin">
+        <router-link v-if="auth.token && auth.is_admin" to="/admin">
           <el-button size="small" type="warning">管理后台</el-button>
         </router-link>
         <router-link v-if="auth.token && $route.path === '/admin'" to="/">

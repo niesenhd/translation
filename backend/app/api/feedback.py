@@ -172,6 +172,102 @@ def review_feedback(
         db.close()
 
 
+# ── 管理员：采纳反馈并录入术语库/TM（功能2，补需求 2.11 缺口）──────────
+
+class AdoptTermPayload(BaseModel):
+    source_term: str
+    target_term: str
+    lang_pair: str = Field(max_length=32)
+    domain: str | None = None
+
+
+class AdoptTmpPayload(BaseModel):
+    source_text: str
+    target_text: str
+    lang_pair: str = Field(max_length=32)
+
+
+class FeedbackAdopt(BaseModel):
+    """采纳反馈时可选择录入术语库和/或 TM。"""
+    to_term: AdoptTermPayload | None = None
+    to_tm: AdoptTmpPayload | None = None
+
+
+@router.post("/{feedback_id}/adopt", response_model=FeedbackRead)
+def adopt_feedback(
+    feedback_id: str,
+    payload: FeedbackAdopt,
+    user: CurrentUser = Depends(require_admin),
+):
+    """采纳反馈：可选把建议录入术语库(strict) / TM(source=feedback)，并置 ADOPTED。"""
+    from app.models.term import TermEntry, TermPriority
+    from app.models.translation_memory import TranslationMemory
+    from sqlalchemy import func as _func
+
+    db = SessionLocal()
+    try:
+        entry = db.get(QualityFeedback, feedback_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="反馈不存在")
+
+        if payload.to_term:
+            t = payload.to_term
+            # 术语去重：同 lang_pair + source_term 覆盖
+            exist = db.scalar(
+                select(TermEntry).where(
+                    TermEntry.lang_pair == t.lang_pair,
+                    _func.lower(TermEntry.source_term) == t.source_term.strip().lower(),
+                )
+            )
+            if exist:
+                exist.target_term = t.target_term
+                exist.priority = TermPriority.STRICT
+                if t.domain:
+                    exist.domain = t.domain
+            else:
+                db.add(TermEntry(
+                    id=str(uuid.uuid4()),
+                    source_term=t.source_term,
+                    target_term=t.target_term,
+                    lang_pair=t.lang_pair,
+                    domain=t.domain,
+                    priority=TermPriority.STRICT,
+                    updated_by=user.username,
+                ))
+
+        if payload.to_tm:
+            m = payload.to_tm
+            exist = db.scalar(
+                select(TranslationMemory).where(
+                    TranslationMemory.lang_pair == m.lang_pair,
+                    _func.lower(_func.btrim(TranslationMemory.source_text)) == m.source_text.strip().lower(),
+                )
+            )
+            if exist:
+                exist.target_text = m.target_text
+                exist.source = "feedback"
+                exist.updated_by = user.username
+            else:
+                db.add(TranslationMemory(
+                    id=str(uuid.uuid4()),
+                    source_text=m.source_text,
+                    target_text=m.target_text,
+                    lang_pair=m.lang_pair,
+                    source="feedback",
+                    updated_by=user.username,
+                ))
+
+        entry.status = FeedbackStatus.ADOPTED
+        entry.reviewed_by = user.username
+        db.commit()
+        db.refresh(entry)
+
+        task = db.get(TranslationTask, entry.task_id)
+        return _to_read(entry, task.original_filename if task else None)
+    finally:
+        db.close()
+
+
 # ── 辅助 ─────────────────────────────────────────────────────────────
 
 def _to_read(fb: QualityFeedback, filename: str | None = None) -> FeedbackRead:

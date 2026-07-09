@@ -19,8 +19,8 @@ router.beforeEach((to) => {
   const auth = useAuthStore()
   if (!to.meta.public && !auth.token) return '/login'
   if (to.path === '/login' && auth.token) return '/'
-  // 管理后台需要 admin 用户
-  if (to.meta.admin && auth.username !== 'admin') return '/'
+  // 管理后台需要管理员权限
+  if (to.meta.admin && !auth.is_admin) return '/'
 })
 
 export default router

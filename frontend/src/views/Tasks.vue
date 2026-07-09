@@ -123,6 +123,12 @@
           <el-radio value="no">仅翻译文档文字，图片保持原样</el-radio>
         </el-radio-group>
       </el-form-item>
+      <el-form-item label="精译模式">
+        <el-switch v-model="form.refine_mode" active-value="double_pass" inactive-value="none" />
+        <span style="margin-left: 10px; color: #909399; font-size: 12px">
+          开启后翻译 + 法律译审复核两遍，术语与文体更准（耗时与成本约 2 倍，重要文书建议开启）
+        </span>
+      </el-form-item>
     </el-form>
     <template #footer>
       <el-button @click="dialogVisible = false">取消</el-button>
@@ -170,7 +176,7 @@ const fileList = ref([])
 const selectedFile = ref(null)
 const selectedRows = ref([])
 const tableRef = ref(null)
-const form = reactive({ target_lang: 'zh', output_mode: 'plain', pdf_output_format: 'pdf', translate_images: 'no' })
+const form = reactive({ target_lang: 'zh', output_mode: 'plain', pdf_output_format: 'pdf', translate_images: 'no', refine_mode: 'none' })
 
 // 反馈相关
 const feedbackDialogVisible = ref(false)
@@ -228,6 +234,7 @@ async function submit() {
   fd.append('output_mode', form.output_mode)
   fd.append('pdf_output_format', form.pdf_output_format)
   fd.append('translate_images', form.translate_images)
+  fd.append('refine_mode', form.refine_mode)
   submitting.value = true
   try {
     await api.post('/tasks/upload', fd)

@@ -4,7 +4,7 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict
 
-from app.models.task import OutputMode, PdfOutputFormat, TranslateImagesOption, TaskStatus
+from app.models.task import OutputMode, PdfOutputFormat, RefineMode, TranslateImagesOption, TaskStatus
 
 
 class TaskCreateResponse(BaseModel):
@@ -24,6 +24,7 @@ class TaskRead(BaseModel):
     output_mode: OutputMode
     pdf_output_format: PdfOutputFormat
     translate_images: TranslateImagesOption
+    refine_mode: RefineMode = RefineMode.NONE
     status: TaskStatus
     progress: int
     error_message: Optional[str] = None

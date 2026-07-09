@@ -120,7 +120,10 @@
             <el-input v-model="tmSearch.lang_pair" placeholder="语种方向" clearable style="width: 140px" @clear="fetchTm" />
             <el-button type="primary" @click="fetchTm">搜索</el-button>
           </div>
-          <el-button type="success" @click="showTmDialog()">添加记录</el-button>
+          <div style="display: flex; gap: 8px">
+            <el-button type="warning" @click="importTmFromTask">从任务导入</el-button>
+            <el-button type="success" @click="showTmDialog()">添加记录</el-button>
+          </div>
         </div>
         <el-table :data="tm.items" size="small" stripe>
           <el-table-column prop="source_text" label="原文" show-overflow-tooltip />
@@ -551,6 +554,27 @@ async function fetchTm() {
   if (tmSearch.value.lang_pair) params.lang_pair = tmSearch.value.lang_pair
   const { data } = await api.get('/admin/tm', { params })
   tm.value = data
+}
+
+// 从已完成任务导入 TM（对齐原文/译文段落写入，source=auto）
+async function importTmFromTask() {
+  let taskId
+  try {
+    const res = await ElMessageBox.prompt('输入已完成任务的 ID（任务列表可复制）', '从任务导入 TM', {
+      confirmButtonText: '导入',
+      cancelButtonText: '取消',
+      inputPlaceholder: '任务 UUID',
+    })
+    taskId = res.value?.trim()
+  } catch (e) { return }
+  if (!taskId) return
+  try {
+    const { data } = await api.post(`/admin/tm/import-from-task/${taskId}`)
+    ElMessage.success(`导入完成：新增/更新 ${data.imported} 条，跳过 ${data.skipped} 条`)
+    fetchTm()
+  } catch (e) {
+    ElMessage.error(e.response?.data?.detail || '导入失败')
+  }
 }
 
 function showTmDialog(row) {

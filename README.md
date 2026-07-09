@@ -52,6 +52,28 @@ translation/
 
 ## 维护变更记录
 
+### 2026-07-09（翻译质量四阶段提升 + 本地账密登录 + 测试账号）
+基于律师反馈，分四阶段系统性提升翻译水平，并新增账号体系供律师测试。
+
+- **阶段1 术语库方案改造**：domain="法学" 的 6.8 万条法律词典退出翻译注入（模型裸翻更优，
+  词典释义只会带偏），保留带具体领域标签的精选术语（约 494 条）并恢复双向匹配（满足需求
+  line 257）。en→zh 注入量 14286→494，全部为高质量 strict/preferred 法律术语。
+- **阶段2 文档级术语一致性**：新增 `doc_term_extractor.py`，翻译前一次模型调用从全文抽取
+  关键术语/定义术语/专有名词并锁定译文，合并进 glossary（STRICT）逐段注入，保证同一术语
+  全文统一译法（解决"Transaction Documents 前后译法不一"）。开关 `TRANSLATION_DOC_TERM_EXTRACTION`
+  默认开，仅对 >1500 字符文档触发。
+- **阶段3 两遍法精译**：新增 per-task `refine_mode`（none/double_pass）。开启后每段翻译 +
+  法律译审复核两遍（术语一致性、法律文体、漏译），成本约 2 倍，重要文书用。前端上传表单
+  增"精译模式"开关（默认关）。translator 新增 `review()` + `REVIEW_SYSTEM_PROMPT`。
+- **阶段4 充实 TM + 反馈闭环**：TM 创建/导入去重（同 lang_pair + 归一化 source_text）；
+  新增 `POST /admin/tm/import-from-task/{id}` 从已完成任务对齐段落导入 TM；TM 增 task_id
+  追溯字段；反馈新增 `POST /admin/feedback/{id}/adopt` 采纳时录入术语库(strict)/TM(source=feedback)
+  （补需求 2.11 缺口）；Admin 后台 TM 页增"从任务导入"按钮。
+- **本地账密登录系统**（OA 律智荟对接前的过渡）：新增 User 表 + `/api/auth/login` + `/api/auth/me`，
+  HMAC 签名 token（7 天，app_secret_key 签名），pbkdf2 密码哈希。前端改为用户名/密码登录，
+  启动时校验 token 刷新权限，admin 后台按 is_admin 守卫。原静态 admin token 仍作紧急超管入口。
+- **测试账号**：`scripts/seed_users.py` 幂等建号。已创建 admin + lawyer01~05（随机密码，仅哈希入库）。
+
 ### 2026-07-08（翻译质量治理：定位并修复译文劣化主因）
 
 针对律师反馈"翻译水平低"，逐层定位到三个独立问题并全部修复。**根因是术语库加载逻辑**，

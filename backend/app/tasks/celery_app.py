@@ -286,15 +286,6 @@ def run_translation_task(self, task_id: str) -> None:  # noqa: ARG001
         # 加载术语库
         glossary = get_glossary_for_lang_pair(task.source_lang, task.target_lang)
 
-        ctx = TranslationContext(
-            target_lang=task.target_lang,
-            source_lang=task.source_lang,
-            output_mode=task.output_mode,
-            translate_images=task.translate_images.value,
-            on_progress=on_progress,
-            glossary=glossary,
-            tm_lookup=lookup_tm,
-        )
         # 每个任务开始前重置模型单例，确保管理员后台切换模型后 worker 进程立即生效。
         # （reset_* 只影响本 worker 子进程的内存单例；prefork 下同一进程同一时刻只跑
         #  一个任务，故此处重置安全，不会影响其它正在执行的任务。）
@@ -303,6 +294,30 @@ def run_translation_task(self, task_id: str) -> None:  # noqa: ARG001
         reset_translator()
         reset_ocr_client()
         translator = get_translator()
+
+        # 文档级术语抽取（功能B）：一次调用抽出全文关键术语，合并进 glossary（STRICT），
+        # 保证定义术语/专有名词全文统一译法。失败或文本过短返回空，不影响翻译。
+        if _settings.translation_doc_term_extraction:
+            from app.services.doc_term_extractor import extract_document_terms
+            doc_terms = extract_document_terms(
+                task.file_ext, source_bytes,
+                task.source_lang, task.target_lang, translator,
+            )
+            if doc_terms:
+                # doc-term 优先：放在列表前，_match_glossary 的 strict 优先 +
+                # 最长优先去重会确保它们压过同源的全局 preferred 条目
+                glossary = doc_terms + (glossary or [])
+
+        ctx = TranslationContext(
+            target_lang=task.target_lang,
+            source_lang=task.source_lang,
+            output_mode=task.output_mode,
+            translate_images=task.translate_images.value,
+            on_progress=on_progress,
+            glossary=glossary,
+            tm_lookup=lookup_tm,
+            refine_mode=getattr(task, "refine_mode", None) and task.refine_mode.value or "none",
+        )
 
         result_bytes, out_ext = translate_file(
             task.file_ext,

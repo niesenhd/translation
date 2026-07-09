@@ -17,7 +17,7 @@ from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.security import CurrentUser, get_current_user
 from app.core.storage import download_bytes, secure_remove_object, upload_bytes
-from app.models.task import OutputMode, PdfOutputFormat, TaskStatus, TranslateImagesOption, TranslationTask
+from app.models.task import OutputMode, PdfOutputFormat, RefineMode, TaskStatus, TranslateImagesOption, TranslationTask
 from app.schemas.task import TaskCreateResponse, TaskRead
 from app.tasks.celery_app import run_translation_task
 
@@ -36,6 +36,8 @@ async def upload_and_translate(
     pdf_output_format: Annotated[PdfOutputFormat, Form()] = PdfOutputFormat.PDF,
     # 默认"仅翻译文档文字，图片保持原样"（需求 2.2 默认项），与模型默认一致
     translate_images: Annotated[TranslateImagesOption, Form()] = TranslateImagesOption.NO,
+    # 两遍法精译（功能C）：默认关，重要文书可选 double_pass
+    refine_mode: Annotated[RefineMode, Form()] = RefineMode.NONE,
     user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> TaskCreateResponse:
@@ -67,6 +69,7 @@ async def upload_and_translate(
         output_mode=output_mode,
         pdf_output_format=pdf_output_format,
         translate_images=translate_images,
+        refine_mode=refine_mode,
         source_object=source_object,
         status=TaskStatus.QUEUED,
     )

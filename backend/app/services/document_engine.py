@@ -44,6 +44,8 @@ class TranslationContext:
     glossary: list[dict] | None = field(default=None, repr=False)
     # 翻译记忆库查询函数（由调用方注入）
     tm_lookup: Callable | None = field(default=None, repr=False)
+    # 两遍法精译（功能C）：none=单遍；double_pass=翻译后再用法律译审复核一遍
+    refine_mode: str = "none"
 
 
 # ---------------------- 公共工具 ----------------------
@@ -61,6 +63,7 @@ def _translate_text(translator: Translator, text: str, ctx: TranslationContext) 
         return text
 
     # 优先查翻译记忆库
+    from_tm_exact = False
     if ctx.tm_lookup is not None:
         tm_match = ctx.tm_lookup(text, ctx.source_lang, ctx.target_lang)
         if tm_match and tm_match.get("exact"):
@@ -68,6 +71,7 @@ def _translate_text(translator: Translator, text: str, ctx: TranslationContext) 
             # 高相似但非全等（如仅日期/金额不同）绝不可直接套用——会把
             # 旧记忆中的数字/当事人名写进当前文书。
             translated = tm_match["target_text"]
+            from_tm_exact = True
         elif tm_match and tm_match.get("similarity", 0) >= 0.8:
             # 高相似非全等（80%+），将 TM 结果作为参考注入 prompt
             translated = translator.translate(
@@ -84,6 +88,14 @@ def _translate_text(translator: Translator, text: str, ctx: TranslationContext) 
         # 否则 docx 写回路径会把整段原文抹掉
         logger.warning("译文为空，保留原文兜底：%.60s", text)
         translated = text
+
+    # 两遍法精译（功能C）：对本次新生成的译文做法律译审复核。
+    # 跳过 TM 直接复用（已是审定译文，复核浪费）与原文兜底（无可复核内容）。
+    if ctx.refine_mode == "double_pass" and not from_tm_exact and hasattr(translator, "review"):
+        reviewed = translator.review(text, translated, ctx.target_lang, ctx.source_lang, glossary=ctx.glossary)
+        if reviewed and reviewed.strip():
+            translated = reviewed
+
     if ctx.output_mode == OutputMode.BILINGUAL:
         return _bilingual_join(text, translated)
     return translated

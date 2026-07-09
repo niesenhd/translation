@@ -38,6 +38,13 @@ class TranslateImagesOption(str, enum.Enum):
     NO = "no"  # 仅翻译文档文字，图片保持原样
 
 
+class RefineMode(str, enum.Enum):
+    """两遍法精译模式（功能C）。"""
+
+    NONE = "none"  # 单遍翻译（默认）
+    DOUBLE_PASS = "double_pass"  # 翻译后再用法律译审复核一遍（成本约 2 倍，重要文书用）
+
+
 class TranslationTask(Base):
     __tablename__ = "translation_tasks"
 
@@ -60,6 +67,12 @@ class TranslationTask(Base):
         Enum(TranslateImagesOption, values_callable=lambda x: [e.value for e in x]),
         default=TranslateImagesOption.NO,
         server_default="no",
+    )
+    # 两遍法精译模式（功能C）：none=单遍（默认）；double_pass=翻译+法律译审复核
+    refine_mode: Mapped[RefineMode] = mapped_column(
+        Enum(RefineMode, values_callable=lambda x: [e.value for e in x]),
+        default=RefineMode.NONE,
+        server_default="none",
     )
 
     source_object: Mapped[str] = mapped_column(String(512))  # MinIO 中原文对象 key

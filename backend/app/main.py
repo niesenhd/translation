@@ -7,6 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.api.admin import router as admin_router
+from app.api.auth import router as auth_router
 from app.api.tasks import router as tasks_router
 from app.api.terms import router as terms_router
 from app.api.tm import router as tm_router
@@ -20,6 +21,7 @@ from app.models import term as _term  # noqa: F401
 from app.models import translation_memory as _translation_memory  # noqa: F401
 from app.models import feedback as _feedback  # noqa: F401
 from app.models import model_config as _model_config  # noqa: F401
+from app.models import user as _user  # noqa: F401
 
 # 统一日志配置：所有模块共享同一格式和级别
 logging.basicConfig(
@@ -50,6 +52,12 @@ def _ensure_columns() -> None:
         # 默认 'no'：与需求 2.2 默认项「仅翻译文档文字」及模型 server_default 一致
         "ALTER TABLE translation_tasks "
         "ADD COLUMN IF NOT EXISTS translate_images VARCHAR(8) NOT NULL DEFAULT 'no'",
+        # 2026-07-09: 新增 refine_mode（两遍法精译模式，功能C），默认 none
+        "ALTER TABLE translation_tasks "
+        "ADD COLUMN IF NOT EXISTS refine_mode VARCHAR(16) NOT NULL DEFAULT 'none'",
+        # 2026-07-09: TM 增 task_id（来源任务追溯，功能1）
+        "ALTER TABLE translation_memories "
+        "ADD COLUMN IF NOT EXISTS task_id VARCHAR(36)",
     ]
     with SessionLocal() as session:
         for sql in statements:
@@ -87,6 +95,7 @@ def health(db: Session = Depends(get_db)) -> dict:
 
 
 app.include_router(tasks_router, prefix="/api")
+app.include_router(auth_router, prefix="/api")
 app.include_router(admin_router, prefix="/api")
 app.include_router(terms_router, prefix="/api")
 app.include_router(tm_router, prefix="/api")

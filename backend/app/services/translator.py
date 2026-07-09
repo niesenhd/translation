@@ -43,6 +43,19 @@ GLOSSARY_SECTION = (
 )
 
 
+# 两遍法第二遍：法律译审人设（功能C）
+REVIEW_SYSTEM_PROMPT = (
+    "You are a senior legal translation reviewer for a law firm.\n"
+    "A draft translation into {target_lang} is provided. Revise it for:\n"
+    "- Terminology consistency with the mandatory glossary (apply it everywhere the term recurs).\n"
+    "- Correct, formal legal register (e.g. 'shall'/'may' force, defined-term handling).\n"
+    "- Accuracy: no omissions, no additions, no mistranslations of numbers/names/dates.\n"
+    "- Fluency and correct grammar in the target language.\n"
+    "Preserve all formatting markers, placeholders, clause/article numbers, and line breaks.\n"
+    "Output ONLY the revised translation, no commentary.{glossary_section}"
+)
+
+
 class ContentRejectedError(RuntimeError):
     """内容被 API 拒绝（400 Bad Request），非系统性错误，不应计入熔断。
 
@@ -308,6 +321,104 @@ class DashScopeTranslator(Translator):
                 time.sleep(min(1 + 2 * attempt, 60))
         # 全部重试失败
         raise RuntimeError(f"调用 DashScope 失败：{last_err}") from last_err
+
+    def extract_document_terms(self, source_text: str, target_lang: str) -> list[dict]:
+        """文档级术语抽取：一次调用，从全文抽出需统一译法的关键术语并给出译文。
+
+        用于解决"同一术语全文译法不一致"——抽取结果合并进该文档的 glossary
+        （标 STRICT），逐段注入，保证定义术语/专有名词全文统一。失败时返回空列表，
+        不影响主翻译流程。
+        """
+        target_name = resolve_language_name(target_lang)
+        prompt = (
+            "You are a legal terminology extractor. From the SOURCE TEXT, extract the terms "
+            "that MUST be translated consistently throughout a document: defined terms "
+            "(often capitalized or quoted), legal terms of art, and important proper nouns "
+            "/ entity names / recurring key phrases.\n"
+            "For each term give its translation into {tgt}. Output ONLY a JSON array, no prose. "
+            "Format: [{\"source\": \"...\", \"target\": \"...\"}]. Limit to the ~25 most important.\n\n"
+            "SOURCE TEXT:\n{src}"
+        ).format(tgt=target_name, src=source_text[:8000])
+        try:
+            completion = self._client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": "You output only valid JSON arrays."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+                max_tokens=2048,
+                extra_body={"enable_thinking": False},
+            )
+            raw = (completion.choices[0].message.content or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("文档术语抽取失败，跳过（不影响翻译）：%s", exc)
+            return []
+
+        # 鲁棒解析：去掉 ``` 代码围栏，截取第一个 JSON 数组
+        raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
+        start = raw.find("[")
+        end = raw.rfind("]")
+        if start == -1 or end == -1 or end <= start:
+            return []
+        import json
+        try:
+            items = json.loads(raw[start:end + 1])
+        except Exception:  # noqa: BLE001
+            return []
+        terms = []
+        seen = set()
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            s = (it.get("source") or "").strip()
+            t = (it.get("target") or "").strip()
+            key = s.lower()
+            if not s or not t or key in seen:
+                continue
+            seen.add(key)
+            terms.append({"source_term": s, "target_term": t, "priority": "strict"})
+        return terms
+
+    def review(self, source: str, draft: str, target_lang: str, source_lang: str = "auto",
+               glossary: list[dict] | None = None) -> str:
+        """两遍法第二遍：以法律译审人设复核初译，输出修订后的译文。
+
+        复核术语一致性（对照术语表）、法律文体规范、漏译/错译。失败时返回初译兜底，
+        不阻断任务。
+        """
+        if not draft.strip():
+            return draft
+        target_name = resolve_language_name(target_lang)
+        glossary_section = ""
+        if glossary:
+            relevant = _match_glossary(source, glossary)
+            if relevant:
+                lines = [
+                    f"- [STRICT] \"{t['source_term']}\" → \"{t['target_term']}\""
+                    for t in relevant
+                ]
+                glossary_section = GLOSSARY_SECTION.format(glossary="\n".join(lines))
+
+        prompt = REVIEW_SYSTEM_PROMPT.format(target_lang=target_name, glossary_section=glossary_section)
+        try:
+            completion = self._client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content":
+                        f"SOURCE:\n{source}\n\nDRAFT TRANSLATION:\n{draft}\n\n"
+                        "Output only the revised translation."},
+                ],
+                temperature=0.2,
+                max_tokens=min(8192, max(2048, (len(draft) // 2) * 3)),
+                extra_body={"enable_thinking": False},
+            )
+            content = (completion.choices[0].message.content or "").strip()
+            return content or draft
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("两遍法复核失败，保留初译：%s", exc)
+            return draft
 
 
 _translator: Translator | None = None

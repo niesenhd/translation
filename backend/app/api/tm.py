@@ -11,6 +11,7 @@ from sqlalchemy import delete, func, select
 from app.core.database import SessionLocal
 from app.core.security import CurrentUser, require_admin
 from app.models.translation_memory import TranslationMemory
+from app.models.task import TaskStatus, TranslationTask
 
 router = APIRouter(prefix="/admin/tm", tags=["translation-memory"], dependencies=[Depends(require_admin)])
 
@@ -47,6 +48,55 @@ class TMRead(BaseModel):
 class TMPage(BaseModel):
     items: list[TMRead]
     total: int
+
+
+class ImportResult(BaseModel):
+    imported: int
+    skipped: int
+
+
+def _to_read(t: TranslationMemory) -> TMRead:
+    return TMRead(
+        id=t.id,
+        source_text=t.source_text,
+        target_text=t.target_text,
+        lang_pair=t.lang_pair,
+        source=t.source,
+        domain=t.domain,
+        created_at=t.created_at.isoformat() if t.created_at else "",
+        updated_at=t.updated_at.isoformat() if t.updated_at else "",
+    )
+
+
+def _upsert_tm(db, source_text: str, target_text: str, lang_pair: str,
+               source: str, domain: str | None, task_id: str | None,
+               username: str) -> bool:
+    """去重写入：同 lang_pair + 归一化 source_text 已存在则更新 target，否则新增。返回是否写入。"""
+    norm = source_text.strip().lower()
+    existing = db.scalar(
+        select(TranslationMemory).where(
+            TranslationMemory.lang_pair == lang_pair,
+            func.lower(func.btrim(TranslationMemory.source_text)) == norm,
+        )
+    )
+    if existing:
+        if existing.target_text != target_text:
+            existing.target_text = target_text
+            existing.updated_by = username
+            if task_id:
+                existing.task_id = task_id
+        return True
+    db.add(TranslationMemory(
+        id=str(uuid.uuid4()),
+        source_text=source_text,
+        target_text=target_text,
+        lang_pair=lang_pair,
+        source=source,
+        domain=domain,
+        task_id=task_id,
+        updated_by=username,
+    ))
+    return True
 
 
 # ── CRUD ─────────────────────────────────────────────────────────────
@@ -102,28 +152,92 @@ def list_tm(
 def create_tm(payload: TMCreate, user: CurrentUser = Depends(require_admin)):
     db = SessionLocal()
     try:
-        entry = TranslationMemory(
-            id=str(uuid.uuid4()),
-            source_text=payload.source_text,
-            target_text=payload.target_text,
-            lang_pair=payload.lang_pair,
-            source=payload.source,
-            domain=payload.domain,
-            updated_by=user.username,
-        )
-        db.add(entry)
+        _upsert_tm(db, payload.source_text, payload.target_text, payload.lang_pair,
+                   payload.source, payload.domain, None, user.username)
         db.commit()
-        db.refresh(entry)
-        return TMRead(
-            id=entry.id,
-            source_text=entry.source_text,
-            target_text=entry.target_text,
-            lang_pair=entry.lang_pair,
-            source=entry.source,
-            domain=entry.domain,
-            created_at=entry.created_at.isoformat() if entry.created_at else "",
-            updated_at=entry.updated_at.isoformat() if entry.updated_at else "",
+        norm = payload.source_text.strip().lower()
+        entry = db.scalar(
+            select(TranslationMemory).where(
+                TranslationMemory.lang_pair == payload.lang_pair,
+                func.lower(func.btrim(TranslationMemory.source_text)) == norm,
+            )
         )
+        return _to_read(entry)
+    finally:
+        db.close()
+
+
+# ── 从已完成任务导入 TM（功能1）──────────────────────────────────────
+
+def _extract_paragraphs(ext: str, data: bytes) -> list[str]:
+    """抽取段落列表（用于原文/译文按索引对齐）。支持 docx/doc/txt/md，其余返回空。"""
+    ext = ext.lower().lstrip(".")
+    try:
+        if ext in ("txt", "md"):
+            from app.services.document_engine import _decode_text_bytes
+            return [p for p in _decode_text_bytes(data).split("\n") if p.strip()]
+        if ext in ("docx", "doc"):
+            from docx import Document
+            from app.services.document_engine import (
+                _collect_docx_paragraphs, _extract_docx_paragraph_text, _libreoffice_convert,
+            )
+            docx_data = _libreoffice_convert(data, "doc", "docx") if ext == "doc" else data
+            doc = Document(io.BytesIO(docx_data))
+            return [_extract_docx_paragraph_text(p) for p in _collect_docx_paragraphs(doc)]
+    except Exception:
+        return []
+    return []
+
+
+@router.post("/import-from-task/{task_id}", response_model=ImportResult)
+def import_from_task(task_id: str, user: CurrentUser = Depends(require_admin)):
+    """把一个已完成任务的原文-译文段落对齐写入 TM（source=auto，带去重）。
+
+    仅支持 docx/doc/txt/md（段落对齐清晰）。对照模式结果按 \n 拆出译文。
+    """
+    from app.core.storage import download_bytes
+
+    db = SessionLocal()
+    try:
+        task = db.get(TranslationTask, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        if task.status not in (TaskStatus.SUCCEEDED,):
+            raise HTTPException(status_code=400, detail="仅已成功的任务可导入 TM")
+        if not task.source_object or not task.result_object:
+            raise HTTPException(status_code=400, detail="原文或译文已被清理")
+        ext = task.file_ext.lower().lstrip(".")
+        if ext not in ("docx", "doc", "txt", "md"):
+            raise HTTPException(status_code=400, detail=f"暂不支持 {ext} 格式从任务导入 TM（支持 docx/doc/txt/md）")
+
+        src_paras = _extract_paragraphs(ext, download_bytes(task.source_object))
+        res_paras = _extract_paragraphs(ext, download_bytes(task.result_object))
+        if not src_paras or not res_paras:
+            raise HTTPException(status_code=400, detail="无法从文件抽取段落")
+
+        lang_pair = f"{(task.source_lang if task.source_lang != 'auto' else 'src')}→{task.target_lang}"
+        # 若源语言是 auto，尽力推断：英文字母占比高则 en，否则 zh
+        if task.source_lang == "auto":
+            sample = " ".join(src_paras[:20])
+            en_ratio = sum(c.isascii() and c.isalpha() for c in sample) / max(len(sample), 1)
+            lang_pair = f"{'en' if en_ratio > 0.5 else 'zh'}→{task.target_lang}"
+
+        imported = skipped = 0
+        n = min(len(src_paras), len(res_paras))
+        for i in range(n):
+            s = src_paras[i].strip()
+            r = res_paras[i].strip()
+            if not s or len(s) < 8:
+                continue
+            # 对照模式：取换行后的译文部分
+            t = r.split("\n", 1)[1].strip() if "\n" in r else r
+            if not t or len(t) < 4 or t == s:
+                skipped += 1
+                continue
+            _upsert_tm(db, s, t, lang_pair, "auto", None, task.id, user.username)
+            imported += 1
+        db.commit()
+        return ImportResult(imported=imported, skipped=skipped)
     finally:
         db.close()
 

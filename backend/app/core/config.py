@@ -55,6 +55,8 @@ class Settings(BaseSettings):
     # 分片相关：单分片最大字符数 / 末分片合并下限
     translation_chunk_max_chars: int = 6_000
     translation_chunk_min_chars: int = 1_500
+    # 文档级术语抽取（功能B）：翻译前一次调用抽取全文关键术语，保证定义术语全文统一译法
+    translation_doc_term_extraction: bool = True
     # 文件保留天数：默认 180 天，0 表示永不过期；管理员可通过 system_config 表动态调整
     file_retention_days: int = 180
 
