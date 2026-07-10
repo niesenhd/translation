@@ -10,7 +10,8 @@ WORKDIR /app
 
 # 系统依赖：python-docx 不需要额外编译，pdf2docx / PyMuPDF 需要 libgl 等
 # LibreOffice：用于 .doc → .docx / .ppt → .pptx 转换
-# fonts-wqy-zenhei：CJK 字体，图片 OCR 文字替换时使用
+# fonts-wqy-zenhei / fonts-noto-cjk：CJK 字体，图片 OCR 文字替换时使用
+# fonts-noto-core：含 NotoNaskhArabic / NotoSansArabic 等，PDF 阿语等 RTL 脚本写回需要
 RUN sed -i 's|http://deb.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g; s|http://security.debian.org|https://mirrors.tuna.tsinghua.edu.cn/debian-security|g' /etc/apt/sources.list.d/debian.sources \
     && apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
@@ -22,6 +23,7 @@ RUN sed -i 's|http://deb.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g; s|ht
         libreoffice-common \
         fonts-wqy-zenhei \
         fonts-noto-cjk \
+        fonts-noto-core \
     && rm -rf /var/lib/apt/lists/*
 
 # 复制全部源码后再安装（非 editable 模式需要源码存在）

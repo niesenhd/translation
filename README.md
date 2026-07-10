@@ -75,7 +75,8 @@ translation/
   到白底转 RGB，避免 `cannot write mode RGBA as JPEG` 被吞后返回未翻译原图。
 - 🟠 **P2 PDF 阿语字体**（新增 `_pdf_font_for_lang`）：按目标语种选字体——日/韩用内置 CJK 字体、
   繁中 china-t、阿语尝试系统 Noto Naskh/Sans Arabic（`insert_textbox` 传 fontfile），找不到回退
-  china-s 并告警。**运维注意：阿语 PDF 需服务器安装 `fonts-noto`（apt install fonts-noto-core）。**
+  china-s 并告警。已在 `backend/Dockerfile` 加入 `fonts-noto-core`（含 NotoNaskhArabic/NotoSansArabic），
+  重建镜像后阿语字体随镜像内置，无需手动装。
 - 🟠 **P2 XLSX 工作表名边界**（`translate_xlsx` 写回）：补充去首尾单引号、空名/保留名（History）回退
   原名、重名去重改为大小写不敏感（Excel 表名不区分大小写）。
 - ⚪ **P3 translate_images 默认值不一致**（`TranslationContext`）：默认 `yes`→`no`，与 DB/API 对齐
