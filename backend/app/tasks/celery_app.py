@@ -47,6 +47,12 @@ celery_app.conf.update(
             "task": "translation.cleanup_expired_files",
             "schedule": crontab(hour=3, minute=0),
         },
+        # 每 5 分钟对账：把 worker 重启/异常退出导致的"孤儿 RUNNING 任务"标记为失败，
+        # 避免状态永久卡在 RUNNING（worker 被杀时来不及跑收尾）。
+        "reconcile-stuck-tasks": {
+            "task": "translation.reconcile_stuck_tasks",
+            "schedule": crontab(minute="*/5"),
+        },
     },
 )
 
@@ -55,6 +61,52 @@ celery_app.conf.update(
 def cleanup_expired_files_task() -> dict:
     """Celery Beat 定时任务：清理过期文件（覆写 + 删除）。"""
     return cleanup_expired_files().as_dict()
+
+
+@celery_app.task(name="translation.reconcile_stuck_tasks")
+def reconcile_stuck_tasks_task() -> dict:
+    """对账孤儿任务：RUNNING 但已无活跃 worker（并发槽位过期/缺失）的任务标记为 FAILED。
+
+    判定：任务处于 RUNNING，但其并发槽位（ZSET translation:running）缺失或心跳超过 TTL。
+    正在跑的任务每 ~2s 刷新槽位心跳，槽位 600s TTL 自愈；worker 被杀后心跳停止、
+    槽位过期消失，但 DB 状态仍停在 RUNNING —— 这类孤儿任务在此自动标记失败，
+    用户可点重试。同时清理可能泄漏的槽位。
+    """
+    from sqlalchemy import select, update
+
+    db = SessionLocal()
+    reconciled = 0
+    try:
+        running = list(db.scalars(
+            select(TranslationTask).where(TranslationTask.status == TaskStatus.RUNNING)
+        ))
+        if not running:
+            return {"checked": 0, "reconciled": 0}
+        r = _redis_client()
+        now = time.time()
+        stale_cutoff = now - _SLOT_TTL_SECONDS - 120  # TTL + 2 分钟缓冲
+        for task in running:
+            score = r.zscore(_CONCURRENCY_ZSET, task.id)
+            # 槽位缺失(None) 或 心跳过期 → worker 已死，孤儿任务
+            if score is None or score < stale_cutoff:
+                db.execute(
+                    update(TranslationTask)
+                    .where(TranslationTask.id == task.id)
+                    .values(
+                        status=TaskStatus.FAILED,
+                        error_message="任务运行中断（服务器重启或 worker 异常退出），请点重试重新翻译。",
+                    )
+                )
+                # 清理可能残留的槽位
+                _release_concurrency_slot(task.id)
+                reconciled += 1
+                logger.warning("对账：孤儿任务 %s 标记为 FAILED（槽位 score=%s）", task.id, score)
+        if reconciled:
+            db.commit()
+    finally:
+        db.close()
+    logger.info("对账完成：检查 %d 个 RUNNING，标记 %d 个孤儿为 FAILED", len(running), reconciled)
+    return {"checked": len(running), "reconciled": reconciled}
 
 
 class TaskCancelled(Exception):
