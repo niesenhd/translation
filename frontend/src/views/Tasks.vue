@@ -112,6 +112,14 @@
           <el-radio value="bilingual">双语对照</el-radio>
         </el-radio-group>
       </el-form-item>
+      <el-form-item v-if="form.output_mode === 'bilingual'" label="脚注处理">
+        <el-radio-group v-model="form.footnote_mode">
+          <el-radio value="bilingual">脚注双语（原文+译文）</el-radio>
+          <el-radio value="translation_only">脚注仅译文</el-radio>
+          <el-radio value="skip">脚注不翻译</el-radio>
+        </el-radio-group>
+        <div style="color: #909399; font-size: 12px; margin-top: 2px">脚注很长时选"仅译文"可避免版面被脚注撑开/切割；文档无脚注则本项无效</div>
+      </el-form-item>
       <el-form-item v-if="isPdf" label="PDF 输出">
         <el-radio-group v-model="form.pdf_output_format">
           <el-radio value="pdf">原版 PDF（保留版面/页眉页脚/图片）</el-radio>
@@ -177,7 +185,7 @@ const fileList = ref([])
 const selectedFile = ref(null)
 const selectedRows = ref([])
 const tableRef = ref(null)
-const form = reactive({ target_lang: 'zh', output_mode: 'plain', pdf_output_format: 'pdf', translate_images: 'no', refine_mode: 'none' })
+const form = reactive({ target_lang: 'zh', output_mode: 'plain', pdf_output_format: 'pdf', translate_images: 'no', refine_mode: 'none', footnote_mode: 'bilingual' })
 
 // 反馈相关
 const feedbackDialogVisible = ref(false)
@@ -236,6 +244,7 @@ async function submit() {
   fd.append('pdf_output_format', form.pdf_output_format)
   fd.append('translate_images', form.translate_images)
   fd.append('refine_mode', form.refine_mode)
+  fd.append('footnote_mode', form.footnote_mode)
   submitting.value = true
   try {
     await api.post('/tasks/upload', fd)

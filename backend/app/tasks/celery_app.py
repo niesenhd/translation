@@ -317,6 +317,7 @@ def run_translation_task(self, task_id: str) -> None:  # noqa: ARG001
             glossary=glossary,
             tm_lookup=lookup_tm,
             refine_mode=getattr(task, "refine_mode", None) and task.refine_mode.value or "none",
+            footnote_mode=getattr(task, "footnote_mode", None) and task.footnote_mode.value or "bilingual",
         )
 
         result_bytes, out_ext = translate_file(

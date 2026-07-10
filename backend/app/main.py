@@ -58,6 +58,9 @@ def _ensure_columns() -> None:
         # 2026-07-09: TM 增 task_id（来源任务追溯，功能1）
         "ALTER TABLE translation_memories "
         "ADD COLUMN IF NOT EXISTS task_id VARCHAR(36)",
+        # 2026-07-09: 新增 footnote_mode（脚注处理，仅双语模式生效），默认 bilingual
+        "ALTER TABLE translation_tasks "
+        "ADD COLUMN IF NOT EXISTS footnote_mode VARCHAR(20) NOT NULL DEFAULT 'bilingual'",
     ]
     with SessionLocal() as session:
         for sql in statements:

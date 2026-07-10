@@ -17,7 +17,7 @@ import re
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable
 
 from docx import Document
@@ -46,6 +46,8 @@ class TranslationContext:
     tm_lookup: Callable | None = field(default=None, repr=False)
     # 两遍法精译（功能C）：none=单遍；double_pass=翻译后再用法律译审复核一遍
     refine_mode: str = "none"
+    # 脚注处理（仅双语模式生效；无脚注文档无影响）：bilingual/translation_only/skip
+    footnote_mode: str = "bilingual"
 
 
 # ---------------------- 公共工具 ----------------------
@@ -600,32 +602,51 @@ def _translate_docx_inplace(doc: Document, translator: Translator, ctx: Translat
     """
     # 正文段落（含表格及嵌套表格内）+ 页眉/页脚段落（普通 python-docx 段落）
     paragraphs = _collect_docx_paragraphs(doc) + _collect_docx_header_footer_paragraphs(doc)
-    # 文本框/内容控件段落（lxml w:p 元素）+ 脚注/尾注段落
+    # 文本框/内容控件段落（lxml w:p 元素）
     xml_paragraphs = _collect_docx_xml_paragraphs(doc)
+    # 脚注/尾注段落（lxml w:p 元素）——单独按 footnote_mode 处理
     fn_paragraphs, fn_roots_map = _get_docx_footnote_paragraphs(doc)
-    all_paragraphs = paragraphs + xml_paragraphs + fn_paragraphs
 
-    if not all_paragraphs:
-        return
-    # 正文段落按"自有 run"提取（含超链接/内联内容控件文字、不含文本框嵌套段落），
-    # 文本框/内容控件/脚注段落用 XML 提取
-    texts = []
-    for i, p in enumerate(all_paragraphs):
-        if i < len(paragraphs):
-            texts.append(_extract_docx_paragraph_text(p))
-        else:
-            texts.append(_extract_paragraph_text_from_xml(p))
-    translated = _translate_many(texts, translator, ctx)
-    for i, (para, original, new_text) in enumerate(zip(all_paragraphs, texts, translated)):
-        if not original.strip():
-            continue
-        if not new_text or not new_text.strip():
-            # 空译文不写回（保留原文），防止段落内容被抹掉
-            continue
-        if i < len(paragraphs):
-            _write_translated_to_paragraph(para, new_text)
-        else:
-            _write_text_to_xml_paragraph(para, new_text)
+    main_paras = paragraphs + xml_paragraphs
+
+    # 1) 正文 + 文本框/内容控件：按 ctx.output_mode 翻译
+    if main_paras:
+        main_texts = []
+        for i, p in enumerate(main_paras):
+            if i < len(paragraphs):
+                main_texts.append(_extract_docx_paragraph_text(p))
+            else:
+                main_texts.append(_extract_paragraph_text_from_xml(p))
+        main_translated = _translate_many(main_texts, translator, ctx)
+        for i, (para, original, new_text) in enumerate(zip(main_paras, main_texts, main_translated)):
+            if not original.strip() or not (new_text and new_text.strip()):
+                continue  # 空原文/空译文不写回，防止段落被抹掉
+            if i < len(paragraphs):
+                _write_translated_to_paragraph(para, new_text)
+            else:
+                _write_text_to_xml_paragraph(para, new_text)
+
+    # 2) 脚注/尾注：footnote_mode 仅在双语模式下生效；纯译文模式脚注照常译为纯译文。
+    #    文档无脚注(fn_paragraphs 为空)时整段跳过，对正文翻译零影响。
+    if fn_paragraphs:
+        fn_mode = ctx.footnote_mode
+        skip_fn = ctx.output_mode == OutputMode.BILINGUAL and fn_mode == "skip"
+        if not skip_fn:
+            # 脚注有效输出模式：
+            #   双语 + footnote_mode=bilingual → 脚注双语(原文+译文)
+            #   双语 + translation_only，或 纯译文模式 → 脚注仅译文(替换原文)
+            if ctx.output_mode == OutputMode.BILINGUAL and fn_mode == "bilingual":
+                fn_out = OutputMode.BILINGUAL
+            else:
+                fn_out = OutputMode.PLAIN
+            fn_ctx = replace(ctx, output_mode=fn_out) if fn_out != ctx.output_mode else ctx
+            fn_texts = [_extract_paragraph_text_from_xml(p) for p in fn_paragraphs]
+            fn_translated = _translate_many(fn_texts, translator, fn_ctx)
+            for para, original, new_text in zip(fn_paragraphs, fn_texts, fn_translated):
+                if not original.strip() or not (new_text and new_text.strip()):
+                    continue
+                _write_text_to_xml_paragraph(para, new_text)
+        # skip_fn：脚注不翻译，保持原文
 
     # 保存脚注/尾注 roots_map 到 doc 对象上供 translate_docx 序列化
     if not hasattr(doc, '_fn_roots_map'):

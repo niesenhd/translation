@@ -45,6 +45,14 @@ class RefineMode(str, enum.Enum):
     DOUBLE_PASS = "double_pass"  # 翻译后再用法律译审复核一遍（成本约 2 倍，重要文书用）
 
 
+class FootnoteMode(str, enum.Enum):
+    """脚注处理方式（仅双语对照模式生效；文档无脚注时本选项无影响）。"""
+
+    BILINGUAL = "bilingual"          # 脚注双语：英文原文 + 中文译文（默认）
+    TRANSLATION_ONLY = "translation_only"  # 脚注仅译文：原文替换为中文，体积减半
+    SKIP = "skip"                    # 脚注不翻译：保持英文原文
+
+
 class TranslationTask(Base):
     __tablename__ = "translation_tasks"
 
@@ -73,6 +81,13 @@ class TranslationTask(Base):
         Enum(RefineMode, values_callable=lambda x: [e.value for e in x]),
         default=RefineMode.NONE,
         server_default="none",
+    )
+    # 脚注处理方式（仅双语对照模式生效；文档无脚注时无影响）：bilingual=脚注双语(默认)；
+    # translation_only=脚注仅译文；skip=脚注不翻译
+    footnote_mode: Mapped[FootnoteMode] = mapped_column(
+        Enum(FootnoteMode, values_callable=lambda x: [e.value for e in x]),
+        default=FootnoteMode.BILINGUAL,
+        server_default="bilingual",
     )
 
     source_object: Mapped[str] = mapped_column(String(512))  # MinIO 中原文对象 key
