@@ -37,7 +37,8 @@ class TranslationContext:
     source_lang: str = "auto"
     output_mode: OutputMode = OutputMode.PLAIN
     # 是否翻译图片中的文字（yes=翻译，no=仅翻译文档文字，图片保持原样）
-    translate_images: str = "yes"
+    # 默认与 DB/API 对齐为 "no"（celery_app 构造时总会显式传 DB 值，此默认仅防御性对齐）
+    translate_images: str = "no"
     # 进度回调：(已完成段数, 总段数) -> None
     on_progress: Callable[[int, int], None] | None = field(default=None, repr=False)
     # 术语库（由调用方注入）
@@ -577,11 +578,6 @@ def _element_is_preservable(r_elem) -> bool:
     return any(r_elem.find(path) is not None for path in _PRESERVABLE_DESCENDANTS)
 
 
-def _run_is_preservable(run) -> bool:
-    """python-docx Run 对象版本的不可覆盖判断。"""
-    return _element_is_preservable(run._element)
-
-
 def _write_translated_to_paragraph(paragraph, new_text: str) -> None:
     """把翻译后的文本写回段落，保留其中的图片/嵌入对象/脚注引用/字段。
 
@@ -652,19 +648,6 @@ def _translate_docx_inplace(doc: Document, translator: Translator, ctx: Translat
     if not hasattr(doc, '_fn_roots_map'):
         doc._fn_roots_map = {}
     doc._fn_roots_map.update(fn_roots_map)
-
-
-def _translate_paragraph(paragraph, translator: Translator, ctx: TranslationContext) -> None:
-    """保留以单段函数（用于将来调用方便），目前主流程已走并发版本。"""
-    text = paragraph.text
-    if not text.strip():
-        return
-    translated = translator.translate(text, ctx.target_lang, ctx.source_lang)
-    if ctx.output_mode == OutputMode.BILINGUAL:
-        new_text = _bilingual_join(text, translated)
-    else:
-        new_text = translated
-    _write_translated_to_paragraph(paragraph, new_text)
 
 
 def _replace_docx_images(doc: Document, ctx: TranslationContext) -> None:
@@ -766,41 +749,82 @@ def _flush_footnote_parts(doc: Document) -> None:
 def _apply_docx_rtl(doc: Document) -> None:
     """P1.5：为 DOCX 文档设置 RTL（从右到左）排版。
 
-    遍历所有段落和表格单元格，设置双向文本属性。
+    覆盖范围（旧实现仅正文段落 + 顶层表格，遗漏以下区域）：
+    - 正文段落 + 嵌套表格（任意层级）
+    - 文本框内容（w:txbxContent 内的段落）
+    - 页眉/页脚（含首页/偶数页变体）
+    - 脚注/尾注（独立 part）
+
+    实现：改为 XML 级遍历——对每个相关 part 的所有 <w:p> 统一设置 bidi + 右对齐
+    + run rtl，从根本上覆盖 python-docx 高层 API 触达不到的嵌套/文本框结构。
     """
     from docx.oxml.ns import qn
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-    for paragraph in doc.paragraphs:
-        _set_paragraph_rtl(paragraph)
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for paragraph in cell.paragraphs:
-                    _set_paragraph_rtl(paragraph)
+    def _rtl_paragraph_element(p_elem) -> None:
+        pPr = p_elem.find(qn("w:pPr"))
+        if pPr is None:
+            pPr = p_elem.makeelement(qn("w:pPr"), {})
+            p_elem.insert(0, pPr)
+        bidi = pPr.find(qn("w:bidi"))
+        if bidi is None:
+            bidi = pPr.makeelement(qn("w:bidi"), {})
+            pPr.append(bidi)
+        bidi.set(qn("w:val"), "1")
+        jc = pPr.find(qn("w:jc"))
+        if jc is None:
+            jc = pPr.makeelement(qn("w:jc"), {})
+            pPr.append(jc)
+        jc.set(qn("w:val"), "right")
+        for r in p_elem.findall(qn("w:r")):
+            rPr = r.find(qn("w:rPr"))
+            if rPr is None:
+                rPr = r.makeelement(qn("w:rPr"), {})
+                r.insert(0, rPr)
+            if rPr.find(qn("w:rtl")) is None:
+                rPr.append(rPr.makeelement(qn("w:rtl"), {}))
 
+    def _rtl_in_root(root) -> None:
+        if root is None:
+            return
+        # iter 递归查找全部 w:p，天然覆盖嵌套表格 / 文本框 txbxContent
+        for p_elem in root.iter(qn("w:p")):
+            _rtl_paragraph_element(p_elem)
 
-def _set_paragraph_rtl(paragraph) -> None:
-    """设置单个段落的 RTL 属性。"""
-    from docx.oxml.ns import qn
+    # 1. 正文（含嵌套表格、文本框）
+    _rtl_in_root(doc.element.body)
 
-    pPr = paragraph._element.get_or_add_pPr()
-    # 设置双向文本：bidi=1 表示 RTL
-    bidi = pPr.find(qn("w:bidi"))
-    if bidi is None:
-        bidi = pPr.makeelement(qn("w:bidi"), {})
-        pPr.append(bidi)
-    bidi.set(qn("w:val"), "1")
-    # 设置右对齐
-    paragraph.alignment = 2  # WD_ALIGN_PARAGRAPH.RIGHT
+    # 2. 页眉/页脚（每个 section 的 header/footer + 首页/偶数页变体）
+    for section in doc.sections:
+        for hf in (
+            section.header, section.first_page_header, section.even_page_header,
+            section.footer, section.first_page_footer, section.even_page_footer,
+        ):
+            try:
+                _rtl_in_root(hf._element)
+            except Exception:  # noqa: BLE001
+                pass
 
-    # 为每个 run 设置 RTL
-    for run in paragraph.runs:
-        rPr = run._element.get_or_add_rPr()
-        rtl = rPr.find(qn("w:rtl"))
-        if rtl is None:
-            rtl = rPr.makeelement(qn("w:rtl"), {})
-            rPr.append(rtl)
+    # 3. 脚注/尾注（独立 part，python-docx 不作为一等 part 暴露，走关系遍历）
+    try:
+        from lxml import etree as _etree
+        for rel in doc.part.rels.values():
+            if "footnotes" not in rel.reltype and "endnotes" not in rel.reltype:
+                continue
+            try:
+                part = rel.target_part
+                if hasattr(part, "_element") and part._element is not None:
+                    _rtl_in_root(part._element)
+                else:
+                    root = _etree.fromstring(part.blob)
+                    _rtl_in_root(root)
+                    part._blob = _etree.tostring(
+                        root, xml_declaration=True, encoding="UTF-8", standalone=True
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+
 
 
 # ---------------------- PDF ----------------------
@@ -1060,6 +1084,43 @@ def _sample_pdf_bg_color(page, rect) -> tuple[float, float, float]:
         return (1, 1, 1)
 
 
+# 阿语等脚本 PyMuPDF 内置字体（china-s 等）无阿拉伯字形，尝试从系统 Noto 字体加载。
+# 服务器需安装 fonts-noto（apt install fonts-noto-core / fonts-noto）方可正常渲染阿语 PDF；
+# 找不到则回退 china-s（不会崩，仅阿语可能显示方块，与旧行为一致）。
+_ARABIC_FONT_CANDIDATES = [
+    "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+    "/usr/share/fonts/opentype/noto/NotoNaskhArabic-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+]
+
+
+def _pdf_font_for_lang(target_lang: str) -> tuple[str, str | None]:
+    """按目标语种返回 (fontname, fontfile) 供 PyMuPDF insert_textbox 使用。
+
+    - 日/韩：使用内置对应 CJK 字体（含拉丁字形）
+    - 繁体中文：china-t
+    - 阿拉伯语：内置字体无阿语字形，尝试系统 Noto Naskh/Sans Arabic；找不到回退 china-s
+    - 其它（含简中/拉丁/西欧）：china-s（含 ASCII+CJK 字形，可正常渲染）
+    fontfile 为 None 时表示使用 PyMuPDF 保留字体名。
+    """
+    lang = (target_lang or "").lower()
+    if lang in ("ja", "jpn", "japanese"):
+        return "japan", None
+    if lang in ("ko", "kor", "korean"):
+        return "korea", None
+    if lang in ("zh-tw", "zh-hant", "zh_tw", "zh-hk"):
+        return "china-t", None
+    if lang in ("ar", "ara", "arabic"):
+        for p in _ARABIC_FONT_CANDIDATES:
+            if os.path.exists(p):
+                # 自定义字体需一个 fontname 标签 + fontfile 路径
+                return "noto-arabic", p
+        logger.warning("未找到系统阿拉伯语字体（Noto），PDF 阿语可能显示方块；建议服务器安装 fonts-noto")
+        return "china-s", None
+    return "china-s", None
+
+
 def translate_pdf_inplace(data: bytes, translator: Translator, ctx: TranslationContext) -> bytes:
     """PDF 就地替换文字（PyMuPDF），最大限度保留版面/页眉页脚/图片。
 
@@ -1074,133 +1135,136 @@ def translate_pdf_inplace(data: bytes, translator: Translator, ctx: TranslationC
     import fitz  # PyMuPDF
 
     doc = fitz.open(stream=data, filetype="pdf")
+    try:
+        # P1.4：检测扫描件 PDF，走整页 OCR 路径
+        if _is_scanned_pdf(doc):
+            _ocr_pdf_scanned_pages(doc, ctx)
+            out = io.BytesIO()
+            doc.save(out, deflate=True, clean=True)
+            return out.getvalue()
 
-    # P1.4：检测扫描件 PDF，走整页 OCR 路径
-    if _is_scanned_pdf(doc):
-        _ocr_pdf_scanned_pages(doc, ctx)
+        # 1. 收集所有可翻译的 span（精确到每个文字片段）
+        #    每个 span 包含：页面索引、bbox、原文、字号、颜色
+        spans_info: list[dict] = []  # [{page_idx, rect, text, size, color}, ...]
+        texts: list[str] = []
+
+        for page_idx, page in enumerate(doc):
+            text_dict = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+            for block in text_dict.get("blocks", []):
+                if block.get("type") != 0:  # 非文字块跳过
+                    continue
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        text = (span.get("text") or "").strip()
+                        if not text:
+                            continue
+                        # 跳过纯数字/符号等无需翻译的内容
+                        if _should_skip_pdf_text(text):
+                            continue
+                        bbox = span.get("bbox")
+                        if not bbox or len(bbox) != 4:
+                            continue
+                        rect = fitz.Rect(bbox)
+                        if rect.width < 2 or rect.height < 2:
+                            continue
+                        size = span.get("size", 10)
+                        color = span.get("color", 0)
+                        # color 是整数，转为 RGB
+                        r = (color >> 16) & 0xFF
+                        g = (color >> 8) & 0xFF
+                        b = color & 0xFF
+
+                        spans_info.append({
+                            "page_idx": page_idx,
+                            "rect": rect,
+                            "text": text,
+                            "size": size,
+                            "color": (r / 255.0, g / 255.0, b / 255.0),
+                        })
+                        texts.append(text)
+
+        if not texts:
+            return data
+
+        # 2. 批量翻译
+        translated = _translate_many(texts, translator, ctx)
+
+        # 2.5 为每个 span 采样背景色（避免有色底/表格底纹页面留白块）
+        # 采样策略：取 span bbox 稍微向外扩展一圈，取该区域的四角像素均值作为背景色
+        for span_info in spans_info:
+            span_info["bg_color"] = _sample_pdf_bg_color(doc[span_info["page_idx"]], span_info["rect"])
+
+        # 3. 逐 span 擦除原文并写入译文
+        for span_info, new_text in zip(spans_info, translated):
+            if not new_text or new_text == span_info["text"]:
+                continue
+
+            page = doc[span_info["page_idx"]]
+            rect = span_info["rect"]
+
+            # 擦除原文（用采样到的背景色填充，避免有色底页面留白块）
+            page.add_redact_annot(rect, fill=span_info["bg_color"])
+
+        # 一次性提交所有擦除
+        for page in doc:
+            page.apply_redactions()
+
+        # 4. 写回译文
+        is_rtl = ctx.target_lang.lower() in ("ar", "ara", "arabic")
+        # 按目标语种选择字体：china-s 仅含 CJK+拉丁字形，阿语等需系统 Noto 字体
+        fontname, fontfile = _pdf_font_for_lang(ctx.target_lang)
+        for span_info, new_text in zip(spans_info, translated):
+            if not new_text or new_text == span_info["text"]:
+                continue
+
+            page = doc[span_info["page_idx"]]
+            rect = span_info["rect"]
+            original_size = span_info["size"]
+            color = span_info["color"]
+
+            # P1.5：阿拉伯语 RTL 排版
+            align = 2 if is_rtl else 0
+
+            # 使用原文的字号作为基准，如果译文放不下则缩小
+            inserted = False
+            for size_reduction in [0, 0.15, 0.3, 0.45, 0.6]:
+                current_size = original_size * (1 - size_reduction)
+                if current_size < 4:
+                    break
+                try:
+                    rc = page.insert_textbox(
+                        rect,
+                        new_text,
+                        fontname=fontname,
+                        fontfile=fontfile,
+                        fontsize=current_size,
+                        align=align,
+                        color=color,
+                    )
+                    if rc >= 0:
+                        inserted = True
+                        break
+                except Exception:
+                    break
+
+            if not inserted:
+                try:
+                    page.insert_textbox(
+                        rect, new_text, fontsize=original_size * 0.5,
+                        fontname=fontname, fontfile=fontfile,
+                        align=align, color=color,
+                    )
+                except Exception:
+                    pass
+
+        # P1.3：内嵌图片 OCR + 就地替换文字
+        _replace_pdf_images(doc, ctx)
+
         out = io.BytesIO()
         doc.save(out, deflate=True, clean=True)
-        doc.close()
         return out.getvalue()
-
-    # 1. 收集所有可翻译的 span（精确到每个文字片段）
-    #    每个 span 包含：页面索引、bbox、原文、字号、颜色
-    spans_info: list[dict] = []  # [{page_idx, rect, text, size, color}, ...]
-    texts: list[str] = []
-
-    for page_idx, page in enumerate(doc):
-        text_dict = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
-        for block in text_dict.get("blocks", []):
-            if block.get("type") != 0:  # 非文字块跳过
-                continue
-            for line in block.get("lines", []):
-                for span in line.get("spans", []):
-                    text = (span.get("text") or "").strip()
-                    if not text:
-                        continue
-                    # 跳过纯数字/符号等无需翻译的内容
-                    if _should_skip_pdf_text(text):
-                        continue
-                    bbox = span.get("bbox")
-                    if not bbox or len(bbox) != 4:
-                        continue
-                    rect = fitz.Rect(bbox)
-                    if rect.width < 2 or rect.height < 2:
-                        continue
-                    size = span.get("size", 10)
-                    color = span.get("color", 0)
-                    # color 是整数，转为 RGB
-                    r = (color >> 16) & 0xFF
-                    g = (color >> 8) & 0xFF
-                    b = color & 0xFF
-
-                    spans_info.append({
-                        "page_idx": page_idx,
-                        "rect": rect,
-                        "text": text,
-                        "size": size,
-                        "color": (r / 255.0, g / 255.0, b / 255.0),
-                    })
-                    texts.append(text)
-
-    if not texts:
-        return data
-
-    # 2. 批量翻译
-    translated = _translate_many(texts, translator, ctx)
-
-    # 2.5 为每个 span 采样背景色（避免有色底/表格底纹页面留白块）
-    # 采样策略：取 span bbox 稍微向外扩展一圈，取该区域的四角像素均值作为背景色
-    for span_info in spans_info:
-        span_info["bg_color"] = _sample_pdf_bg_color(doc[span_info["page_idx"]], span_info["rect"])
-
-    # 3. 逐 span 擦除原文并写入译文
-    for span_info, new_text in zip(spans_info, translated):
-        if not new_text or new_text == span_info["text"]:
-            continue
-
-        page = doc[span_info["page_idx"]]
-        rect = span_info["rect"]
-
-        # 擦除原文（用采样到的背景色填充，避免有色底页面留白块）
-        page.add_redact_annot(rect, fill=span_info["bg_color"])
-
-    # 一次性提交所有擦除
-    for page in doc:
-        page.apply_redactions()
-
-    # 4. 写回译文
-    for span_info, new_text in zip(spans_info, translated):
-        if not new_text or new_text == span_info["text"]:
-            continue
-
-        page = doc[span_info["page_idx"]]
-        rect = span_info["rect"]
-        original_size = span_info["size"]
-        color = span_info["color"]
-
-        # P1.5：阿拉伯语 RTL 排版
-        is_rtl = ctx.target_lang.lower() in ("ar", "ara", "arabic")
-        align = 2 if is_rtl else 0
-
-        # 使用原文的字号作为基准，如果译文放不下则缩小
-        fontname = "china-s"
-        inserted = False
-        for size_reduction in [0, 0.15, 0.3, 0.45, 0.6]:
-            current_size = original_size * (1 - size_reduction)
-            if current_size < 4:
-                break
-            try:
-                rc = page.insert_textbox(
-                    rect,
-                    new_text,
-                    fontname=fontname,
-                    fontsize=current_size,
-                    align=align,
-                    color=color,
-                )
-                if rc >= 0:
-                    inserted = True
-                    break
-            except Exception:
-                break
-
-        if not inserted:
-            try:
-                page.insert_textbox(
-                    rect, new_text, fontsize=original_size * 0.5,
-                    align=align, color=color,
-                )
-            except Exception:
-                pass
-
-    # P1.3：内嵌图片 OCR + 就地替换文字
-    _replace_pdf_images(doc, ctx)
-
-    out = io.BytesIO()
-    doc.save(out, deflate=True, clean=True)
-    doc.close()
-    return out.getvalue()
+    finally:
+        doc.close()
 
 
 def _libreoffice_convert(data: bytes, source_ext: str, target_ext: str) -> bytes:
@@ -1514,6 +1578,49 @@ def _collect_pptx_diagram_parts(prs) -> list:
     return parts
 
 
+def _set_pptx_paragraph_text(p, new_text: str) -> None:
+    """把译文写回 PPTX 段落：译文放首 run（保留其字体），其余原 run 清空。
+
+    关键：PowerPoint 不把 run 文本里的 "\\n" 当换行（会挤在同一行），
+    对照模式（原文 + \\n + 译文）必须用 <a:br/> 软换行元素分行。
+    因此当译文含 \\n 时，在首 run 之后依次插入 <a:br/> + 克隆的 run 承载后续行，
+    克隆首 run 的 rPr 以保持字体一致。
+    """
+    import copy
+    from pptx.oxml.ns import qn
+
+    runs = list(p.runs)
+    if not runs:
+        return
+    lines = new_text.split("\n")
+    first_run = runs[0]
+    first_run.text = lines[0]
+    for r in runs[1:]:
+        r.text = ""
+
+    if len(lines) == 1:
+        return
+
+    r_elem = first_run._r
+    rPr = r_elem.find(qn("a:rPr"))  # 首 run 样式，用于克隆
+    anchor = r_elem
+    for line in lines[1:]:
+        br = anchor.makeelement(qn("a:br"), {})
+        if rPr is not None:
+            br.append(copy.deepcopy(rPr))
+        anchor.addnext(br)
+        anchor = br
+
+        new_r = anchor.makeelement(qn("a:r"), {})
+        if rPr is not None:
+            new_r.append(copy.deepcopy(rPr))
+        t = new_r.makeelement(qn("a:t"), {})
+        t.text = line
+        new_r.append(t)
+        anchor.addnext(new_r)
+        anchor = new_r
+
+
 def translate_pptx(data: bytes, translator: Translator, ctx: TranslationContext) -> bytes:
     """PPT (.pptx) 翻译。
 
@@ -1547,8 +1654,15 @@ def translate_pptx(data: bytes, translator: Translator, ctx: TranslationContext)
             return
         # 表格
         if shape.has_table:
+            # 合并单元格：row.cells 对同一合并区域会返回同一个 cell 对象多次，
+            # 需按 cell 底层元素去重，否则同一格被重复翻译（浪费 API）且对照模式重复写入。
+            seen_cells: set = set()
             for row in shape.table.rows:
                 for cell in row.cells:
+                    cell_id = id(cell._tc) if hasattr(cell, "_tc") else id(cell)
+                    if cell_id in seen_cells:
+                        continue
+                    seen_cells.add(cell_id)
                     if cell.text_frame:
                         for p in cell.text_frame.paragraphs:
                             paragraphs.append(p)
@@ -1623,15 +1737,11 @@ def translate_pptx(data: bytes, translator: Translator, ctx: TranslationContext)
     smart_translated = translated[len(para_texts):]
 
     # 3. 写回 paragraph：把译文放在第一个 run，其余 run 清空（保留首 run 字体）
+    #    对照模式译文含 \n，PowerPoint 不解释 \n，需转成 <a:br/>（见 _set_pptx_paragraph_text）
     for p, new_text in zip(paragraphs, para_translated):
         if not new_text:
             continue
-        runs = list(p.runs)
-        if not runs:
-            continue
-        runs[0].text = new_text
-        for r in runs[1:]:
-            r.text = ""
+        _set_pptx_paragraph_text(p, new_text)
 
     # 4. 写回 SmartArt 文本元素
     for t_elem, new_text in zip(smartart_text_elements, smart_translated):
@@ -1834,18 +1944,25 @@ def translate_xlsx(data: bytes, translator: Translator, ctx: TranslationContext)
         if kind == "sheet_name":
             sheet_idx = loc[1]
             ws = wb.worksheets[sheet_idx]
-            new_title = new_text.strip()[:31]  # Excel sheet 名长度上限 31
+            new_title = new_text.strip()
             # 去除 Excel 不允许的字符
-            new_title = re.sub(r'[\\/*?:\[\]]', "_", new_title) or ws.title
-            # 重名兜底
+            new_title = re.sub(r'[\\/*?:\[\]]', "_", new_title)
+            # Excel 规则：名称不能以单引号开头或结尾
+            new_title = new_title.strip("'")
+            # 长度上限 31
+            new_title = new_title[:31].strip()
+            # 空名 / 保留名兜底：回退原名
+            if not new_title or new_title.lower() == "history":
+                new_title = ws.title
+            # 重名兜底（Excel 工作表名不区分大小写）
             base = new_title
             n = 2
-            while new_title in used_titles:
+            while new_title.lower() in used_titles:
                 suffix = f"_{n}"
                 new_title = base[: 31 - len(suffix)] + suffix
                 n += 1
             ws.title = new_title
-            used_titles.add(new_title)
+            used_titles.add(new_title.lower())
         elif kind == "cell":
             _, sheet_idx, row, col = loc
             ws = wb.worksheets[sheet_idx]

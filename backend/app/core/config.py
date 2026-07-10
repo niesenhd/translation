@@ -1,8 +1,15 @@
 """统一配置（基于 pydantic-settings 读取环境变量）。"""
+import logging
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
+
+# 已知的不安全默认/占位值：这些值一旦出现在生产就等于没有密钥保护
+_INSECURE_SECRET_KEYS = {"", "change-me", "change-me-to-a-random-secret"}
+_INSECURE_ADMIN_TOKENS = {"", "admin-dev-token"}
 
 
 class Settings(BaseSettings):
@@ -72,6 +79,37 @@ class Settings(BaseSettings):
         if self.redis_password:
             return f"redis://:{self.redis_password}@{self.redis_host}:{self.redis_port}/0"
         return f"redis://{self.redis_host}:{self.redis_port}/0"
+
+    @model_validator(mode="after")
+    def _guard_insecure_secrets(self):
+        """生产环境拒绝以默认/占位密钥启动，避免可伪造任意用户的签名 token。
+
+        - app_secret_key 是 HMAC 登录 token 的签名密钥（见 core/security.py）；
+          若为默认值，攻击者可离线伪造任意 admin token 绕过认证。
+        - 判定生产：app_env in {production, prod}。开发环境仅告警不阻断。
+        """
+        is_prod = self.app_env.strip().lower() in ("production", "prod")
+        secret_insecure = self.app_secret_key.strip() in _INSECURE_SECRET_KEYS
+        admin_insecure = self.app_admin_token.strip() in _INSECURE_ADMIN_TOKENS
+
+        if is_prod:
+            problems = []
+            if secret_insecure:
+                problems.append("APP_SECRET_KEY 仍为默认/占位值")
+            if admin_insecure:
+                problems.append("APP_ADMIN_TOKEN 仍为默认值")
+            if problems:
+                raise ValueError(
+                    "检测到不安全配置（APP_ENV=production）：" + "；".join(problems)
+                    + "。请在 deploy/.env 改为随机强值（如 `openssl rand -hex 32`）后重启。"
+                )
+        else:
+            if secret_insecure:
+                logger.warning(
+                    "APP_SECRET_KEY 使用默认/占位值，仅限开发测试；生产部署（APP_ENV=production）"
+                    "前务必改为随机强值，否则登录 token 可被伪造。"
+                )
+        return self
 
 
 @lru_cache

@@ -52,6 +52,41 @@ translation/
 
 ## 维护变更记录
 
+### 2026-07-10（外部工具 bug 报告核验 + 批量修复 14 项）
+用其它工具生成的 `bug_report_20260710.xlsx`（15 条）逐条对照代码核验：14 条成立、1 条误报
+（PPTX `font.language_id` —— 实测 python-pptx 1.0.2 该属性存在且赋值生效，非静默丢弃，未改）。
+成立的 14 条全部修复：
+- 🔴 **P0 PaddleOCR 递归死锁**（`paddle_ocr.py`）：`_engine_lock` 由 `Lock()` 改 `RLock()`。
+  非中英语种模型初始化失败时会在持锁状态下递归回退 `_get_ocr_engine("zh")`，普通锁会自锁死
+  锁使 worker 永久挂死。
+- 🔴 **P0 PDF fitz 句柄泄漏**（`document_engine.translate_pdf_inplace`）：整函数用 `try/finally`
+  包裹，确保任何路径（含提前 return / 异常）都 `doc.close()`，避免 fd 耗尽致后续 PDF 全失败。
+- 🟡 **P1 孤儿任务对账竞态**（`celery_app.reconcile_stuck_tasks_task`）：标 FAILED 的 UPDATE 增加
+  `status == RUNNING` 条件 + 校验 rowcount，避免与用户重试（RUNNING→QUEUED）竞态、误杀重试任务。
+- 🟡 **P1 DOCX RTL 遍历不全**（`_apply_docx_rtl`）：改为 XML 级遍历全部 `<w:p>`，覆盖嵌套表格、
+  文本框（txbxContent）、页眉页脚（含首页/偶数页变体）、脚注尾注（旧实现仅正文段落 + 顶层表格）。
+- 🟡 **P1 PPTX 合并单元格重复翻译**（`translate_pptx._walk_shape`）：表格 cell 收集加 `seen_cells`
+  按底层 `_tc` 去重（`row.cells` 对合并区域会返回同一 cell 多次）。
+- 🟡 **P1 PPTX 对照模式不换行**（新增 `_set_pptx_paragraph_text`）：PowerPoint 不解释 `\n`，改用
+  `<a:br/>` 软换行元素 + 克隆首 run 的 `rPr` 承载后续行，原文/译文正常分行且保留字体。
+- 🟠 **P2 OCR 深底浅字不可见**（`ocr._sample_text_color`）：按背景亮度判定前景——深底取最亮像素
+  （浅色文字）、浅底取最暗像素，无有效前景时用背景反色兜底，不再一律返回黑色。
+- 🟠 **P2 RGBA 图片存 JPEG 失败**（`ocr` 就地替换保存）：JPEG 保存前把 RGBA/LA/带透明 P 模式合成
+  到白底转 RGB，避免 `cannot write mode RGBA as JPEG` 被吞后返回未翻译原图。
+- 🟠 **P2 PDF 阿语字体**（新增 `_pdf_font_for_lang`）：按目标语种选字体——日/韩用内置 CJK 字体、
+  繁中 china-t、阿语尝试系统 Noto Naskh/Sans Arabic（`insert_textbox` 传 fontfile），找不到回退
+  china-s 并告警。**运维注意：阿语 PDF 需服务器安装 `fonts-noto`（apt install fonts-noto-core）。**
+- 🟠 **P2 XLSX 工作表名边界**（`translate_xlsx` 写回）：补充去首尾单引号、空名/保留名（History）回退
+  原名、重名去重改为大小写不敏感（Excel 表名不区分大小写）。
+- ⚪ **P3 translate_images 默认值不一致**（`TranslationContext`）：默认 `yes`→`no`，与 DB/API 对齐
+  （无实际行为变化，celery_app 构造时总显式传 DB 值）。
+- ⚪ **P3 删除死代码**（`document_engine`）：移除无调用方的 `_run_is_preservable` /`_translate_paragraph`。
+- ⚪ **P3 密钥默认值守卫**（`config.Settings`）：`APP_ENV=production` 且 `APP_SECRET_KEY`/`APP_ADMIN_TOKEN`
+  仍为默认/占位值时启动即报错拒绝运行；开发环境仅告警。**（不改动服务器现有 .env，仅代码级防护，
+  生产密钥硬化仍按既定暂缓。）**
+- ⚪ **P3 登录防爆破**（`api/auth.login`）：新增基于 Redis 的 IP 级失败限速——5 分钟内失败 5 次锁定
+  15 分钟；成功登录清零；Redis 不可用时 fail-open 不阻断登录。取真实 IP 优先用 `X-Forwarded-For`。
+
 ### 2026-07-10（翻译 prompt 加强：保留时态/情态/法律双连词，方案1+2）
 律师反馈 "do not and will not" 被译成 "不会"，丢失"现在 vs 将来"时态区分（法律上重要）。
 根因：通用 prompt 没显式要求保留时态/情态/双连词；且精译评审用同一模型、同盲区，笼统

@@ -89,14 +89,25 @@ def reconcile_stuck_tasks_task() -> dict:
             score = r.zscore(_CONCURRENCY_ZSET, task.id)
             # 槽位缺失(None) 或 心跳过期 → worker 已死，孤儿任务
             if score is None or score < stale_cutoff:
-                db.execute(
+                # 竞态防护：仅当任务此刻仍为 RUNNING 才标 FAILED。
+                # 从上面查询 running 列表到这里执行 update 之间存在时间窗口，
+                # 用户可能恰好重试了该孤儿任务（RUNNING→QUEUED），或 worker 抢占
+                # 置为其它状态；若无此条件会把 QUEUED 误覆盖成 FAILED，误杀重试。
+                result = db.execute(
                     update(TranslationTask)
-                    .where(TranslationTask.id == task.id)
+                    .where(
+                        TranslationTask.id == task.id,
+                        TranslationTask.status == TaskStatus.RUNNING,
+                    )
                     .values(
                         status=TaskStatus.FAILED,
                         error_message="任务运行中断（服务器重启或 worker 异常退出），请点重试重新翻译。",
                     )
                 )
+                if result.rowcount != 1:
+                    # 状态已在窗口内变化，跳过（不清槽位——留给新状态的属主管理）
+                    logger.info("对账：任务 %s 状态已变化，跳过标记", task.id)
+                    continue
                 # 清理可能残留的槽位
                 _release_concurrency_slot(task.id)
                 reconciled += 1

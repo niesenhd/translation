@@ -663,9 +663,9 @@ def process_image_ocr(
             if region_w < 5 or region_h < 5:
                 continue
 
-            # 在原始图片上采样颜色
-            text_color = _sample_text_color(original_img, x1, y1, x2, y2)
+            # 在原始图片上采样颜色（先采背景，供文字颜色判定深底浅字场景）
             bg_color = _sample_bg_inside(original_img, x1, y1, x2, y2)
+            text_color = _sample_text_color(original_img, x1, y1, x2, y2, bg_color)
 
             # 擦除区域：仅小幅扩大（2px），避免误擦周围内容
             pad = 2
@@ -728,6 +728,17 @@ def process_image_ocr(
             save_format = "JPEG"
         elif mime and "webp" in mime:
             save_format = "WEBP"
+        # JPEG 不支持透明通道：RGBA/P/LA 图片直接 save('JPEG') 会抛
+        # "cannot write mode RGBA as JPEG" 并被外层 except 吞掉 → 返回未翻译原图。
+        # 保存前把带 alpha 的图合成到白底再转 RGB。
+        if save_format == "JPEG" and img.mode not in ("RGB", "L"):
+            if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+                rgba = img.convert("RGBA")
+                background = Image.new("RGB", rgba.size, (255, 255, 255))
+                background.paste(rgba, mask=rgba.split()[-1])
+                img = background
+            else:
+                img = img.convert("RGB")
         img.save(out, format=save_format, quality=95)
         return out.getvalue()
 
@@ -736,16 +747,28 @@ def process_image_ocr(
         return image_bytes
 
 
-def _sample_text_color(img, x1: int, y1: int, x2: int, y2: int) -> tuple:
-    """采样文字区域中的文字颜色（深色像素）。"""
+def _sample_text_color(img, x1: int, y1: int, x2: int, y2: int, bg_color: tuple | None = None) -> tuple:
+    """采样文字区域中的文字颜色。
+
+    旧实现只找"深色像素"（brightness<180），深底白字场景采不到样，兜底返回黑色
+    → 与深背景同色、译文不可见。改为：以背景亮度为基准，深底取最亮像素（浅色文字），
+    浅底取最暗像素（深色文字）；无有效前景像素时用背景反色兜底，保证可读对比。
+    """
     w, h = img.size
-    # 在 bbox 中心区域采样，找最深的颜色作为文字颜色
+    # 在 bbox 中心区域采样
     cx1 = x1 + (x2 - x1) // 4
     cy1 = y1 + (y2 - y1) // 4
     cx2 = x1 + 3 * (x2 - x1) // 4
     cy2 = y1 + 3 * (y2 - y1) // 4
 
-    dark_pixels = []
+    def _lum(p):
+        return p[0] * 0.299 + p[1] * 0.587 + p[2] * 0.114
+
+    # 背景亮度：优先用传入的 bg_color，否则默认按浅底处理
+    bg_lum = _lum(bg_color) if bg_color else 255.0
+    dark_bg = bg_lum < 128  # 深色背景 → 文字应为浅色
+
+    pixels = []
     step = max(1, (cx2 - cx1) // 10)
     for x in range(cx1, min(cx2, w), step):
         for y in range(cy1, min(cy2, h), step):
@@ -754,19 +777,29 @@ def _sample_text_color(img, x1: int, y1: int, x2: int, y2: int) -> tuple:
                 if isinstance(pixel, int):
                     pixel = (pixel, pixel, pixel)
                 if len(pixel) >= 3:
-                    # 计算亮度，取较暗的像素（文字通常是深色）
-                    brightness = pixel[0] * 0.299 + pixel[1] * 0.587 + pixel[2] * 0.114
-                    if brightness < 180:  # 深色像素
-                        dark_pixels.append(pixel[:3])
+                    pixels.append(pixel[:3])
             except IndexError:
                 pass
 
-    if not dark_pixels:
-        return (0, 0, 0)  # 默认黑色
+    if not pixels:
+        # 无采样：用背景反色兜底
+        return (255, 255, 255) if dark_bg else (0, 0, 0)
 
-    # 取最暗的像素（亮度最低）
-    dark_pixels.sort(key=lambda p: p[0] * 0.299 + p[1] * 0.587 + p[2] * 0.114)
-    return dark_pixels[0]
+    # 前景像素 = 与背景亮度差异最大的一侧
+    pixels.sort(key=_lum)
+    if dark_bg:
+        # 深底：取最亮像素作为文字色
+        candidate = pixels[-1]
+        # 若最亮像素仍偏暗（采样全是背景），用白色兜底保证可见
+        if _lum(candidate) - bg_lum < 40:
+            return (255, 255, 255)
+        return candidate
+    else:
+        # 浅底：取最暗像素作为文字色
+        candidate = pixels[0]
+        if bg_lum - _lum(candidate) < 40:
+            return (0, 0, 0)
+        return candidate
 
 
 def _sample_bg_inside(img, x1: int, y1: int, x2: int, y2: int) -> tuple:

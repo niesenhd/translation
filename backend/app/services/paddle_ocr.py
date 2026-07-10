@@ -58,7 +58,10 @@ log = logging.getLogger(__name__)
 # 文档的图片仍用中英模型识别，产出乱码。
 _ocr_engines: dict[str, object] = {}
 _structure_engine = None
-_engine_lock = threading.Lock()
+# 必须用 RLock（可重入锁）：_get_ocr_engine 在持锁状态下，遇非中英语种模型
+# 初始化失败时会回退递归调用自身（return _get_ocr_engine("zh")），再次进入
+# `with _engine_lock`。若用普通 Lock() 会自锁死锁，导致 worker 永久挂死。
+_engine_lock = threading.RLock()
 
 
 @dataclass
