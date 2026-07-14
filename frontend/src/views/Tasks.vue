@@ -86,10 +86,10 @@
   <el-dialog v-model="dialogVisible" title="新建翻译任务" width="520px">
     <el-form label-width="100px">
       <el-form-item label="文件">
-        <el-upload :auto-upload="false" :on-change="onFileChange" :file-list="fileList" :limit="1">
+        <el-upload :auto-upload="false" :on-change="onFileChange" :on-remove="onFileRemove" :file-list="fileList" multiple>
           <el-button>选择文件</el-button>
           <template #tip>
-            <div class="el-upload__tip">支持：docx / doc / xlsx / xls / csv / pptx / ppt / pdf / txt / md</div>
+            <div class="el-upload__tip">支持：docx / doc / xlsx / xls / csv / pptx / ppt / pdf / txt / md（可多选）</div>
           </template>
         </el-upload>
       </el-form-item>
@@ -182,7 +182,7 @@ const loading = ref(false)
 const dialogVisible = ref(false)
 const submitting = ref(false)
 const fileList = ref([])
-const selectedFile = ref(null)
+const selectedFiles = ref([])
 const selectedRows = ref([])
 const tableRef = ref(null)
 const form = reactive({ target_lang: 'zh', output_mode: 'plain', pdf_output_format: 'pdf', translate_images: 'no', refine_mode: 'none', footnote_mode: 'bilingual' })
@@ -191,10 +191,9 @@ const form = reactive({ target_lang: 'zh', output_mode: 'plain', pdf_output_form
 const feedbackDialogVisible = ref(false)
 const feedbackForm = reactive({ task_id: '', rating: 0, feedback_type: '', suggestion: '' })
 
-// 当前选择的文件是否为 PDF（控制 PDF 输出格式选择器是否显示）
+// 当前选择的文件中是否包含 PDF（控制 PDF 输出格式选择器是否显示）
 const isPdf = computed(() => {
-  const name = selectedFile.value?.name || ''
-  return /\.pdf$/i.test(name)
+  return selectedFiles.value.some(f => /\.pdf$/i.test(f.name || ''))
 })
 
 let timer = null
@@ -221,7 +220,14 @@ async function fetchTasks() {
 }
 
 function onFileChange(file) {
-  selectedFile.value = file.raw
+  selectedFiles.value.push(file.raw)
+}
+
+function onFileRemove(file) {
+  const idx = selectedFiles.value.findIndex(f => f.name === file.name && f.size === file.size)
+  if (idx > -1) {
+    selectedFiles.value.splice(idx, 1)
+  }
 }
 
 function onSelectionChange(rows) {
@@ -233,31 +239,42 @@ function clearSelection() {
 }
 
 async function submit() {
-  if (!selectedFile.value) {
+  if (!selectedFiles.value.length) {
     ElMessage.warning('请选择文件')
     return
   }
-  const fd = new FormData()
-  fd.append('file', selectedFile.value)
-  fd.append('target_lang', form.target_lang)
-  fd.append('output_mode', form.output_mode)
-  fd.append('pdf_output_format', form.pdf_output_format)
-  fd.append('translate_images', form.translate_images)
-  fd.append('refine_mode', form.refine_mode)
-  fd.append('footnote_mode', form.footnote_mode)
   submitting.value = true
-  try {
-    await api.post('/tasks/upload', fd)
-    ElMessage.success('已提交，开始翻译')
+  const files = [...selectedFiles.value]
+  const results = await Promise.allSettled(
+    files.map(file => {
+      const fd = new FormData()
+      fd.append('file', file)
+      fd.append('target_lang', form.target_lang)
+      fd.append('output_mode', form.output_mode)
+      fd.append('pdf_output_format', form.pdf_output_format)
+      fd.append('translate_images', form.translate_images)
+      fd.append('refine_mode', form.refine_mode)
+      fd.append('footnote_mode', form.footnote_mode)
+      return api.post('/tasks/upload', fd)
+    })
+  )
+  const succeeded = results.filter(r => r.status === 'fulfilled').length
+  const failed = results.filter(r => r.status === 'rejected').length
+  if (succeeded && !failed) {
+    ElMessage.success(`已提交 ${succeeded} 个翻译任务`)
+  } else if (succeeded && failed) {
+    ElMessage.warning(`${succeeded} 个成功，${failed} 个失败`)
+  } else {
+    const reason = results[0]?.reason?.response?.data?.detail || '提交失败'
+    ElMessage.error(reason)
+  }
+  if (succeeded) {
     dialogVisible.value = false
     fileList.value = []
-    selectedFile.value = null
+    selectedFiles.value = []
     fetchTasks()
-  } catch (e) {
-    ElMessage.error(e.response?.data?.detail || '提交失败')
-  } finally {
-    submitting.value = false
   }
+  submitting.value = false
 }
 
 async function downloadFile(url, fallbackName) {
