@@ -83,7 +83,7 @@
     </el-table>
   </el-card>
 
-  <el-dialog v-model="dialogVisible" title="新建翻译任务" width="520px" @open="onDialogOpen">
+  <el-dialog v-model="dialogVisible" title="新建翻译任务" :width="dialogWidth" @open="onDialogOpen">
     <el-form label-width="100px">
       <el-form-item label="文件">
         <el-upload :auto-upload="false" :on-change="onFileChange" :on-remove="onFileRemove" :file-list="fileList" multiple>
@@ -195,6 +195,11 @@ const feedbackForm = reactive({ task_id: '', rating: 0, feedback_type: '', sugge
 const isPdf = computed(() => {
   return selectedFiles.value.some(f => /\.pdf$/i.test(f.name || ''))
 })
+
+// 对话框宽度自适应：小屏 90%，大屏固定 520px
+const winWidth = ref(window.innerWidth)
+const dialogWidth = computed(() => winWidth.value < 768 ? '90%' : '520px')
+window.addEventListener('resize', () => { winWidth.value = window.innerWidth })
 
 let timer = null
 
@@ -448,3 +453,20 @@ onMounted(() => {
 })
 onBeforeUnmount(() => clearInterval(timer))
 </script>
+
+<style scoped>
+/* el-upload 文件名超长截断 */
+:deep(.el-upload-list__item-name) {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* el-table 文件名列超长截断 */
+:deep(.el-table .cell) {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+</style>

@@ -4,12 +4,12 @@
       <!-- 统计看板 -->
       <el-tab-pane label="统计看板" name="stats">
         <el-row :gutter="20" style="margin-bottom: 20px">
-          <el-col :span="4"><el-statistic title="总任务数" :value="stats.total_tasks" /></el-col>
-          <el-col :span="4"><el-statistic title="成功" :value="stats.succeeded_tasks" /></el-col>
-          <el-col :span="4"><el-statistic title="失败" :value="stats.failed_tasks" /></el-col>
-          <el-col :span="4"><el-statistic title="运行中" :value="stats.running_tasks" /></el-col>
-          <el-col :span="4"><el-statistic title="排队中" :value="stats.queued_tasks" /></el-col>
-          <el-col :span="4"><el-statistic title="用户数" :value="stats.total_users" /></el-col>
+          <el-col :xs="12" :sm="8" :md="4"><el-statistic title="总任务数" :value="stats.total_tasks" /></el-col>
+          <el-col :xs="12" :sm="8" :md="4"><el-statistic title="成功" :value="stats.succeeded_tasks" /></el-col>
+          <el-col :xs="12" :sm="8" :md="4"><el-statistic title="失败" :value="stats.failed_tasks" /></el-col>
+          <el-col :xs="12" :sm="8" :md="4"><el-statistic title="运行中" :value="stats.running_tasks" /></el-col>
+          <el-col :xs="12" :sm="8" :md="4"><el-statistic title="排队中" :value="stats.queued_tasks" /></el-col>
+          <el-col :xs="12" :sm="8" :md="4"><el-statistic title="用户数" :value="stats.total_users" /></el-col>
         </el-row>
         <el-row :gutter="20">
           <el-col :span="12">
@@ -87,7 +87,7 @@
         <el-pagination style="margin-top: 16px; justify-content: center" v-model:current-page="termPage" :page-size="20" :total="terms.total" layout="total, prev, pager, next" @current-change="fetchTerms" />
 
         <!-- 术语编辑对话框 -->
-        <el-dialog v-model="termDialogVisible" :title="termForm.id ? '编辑术语' : '添加术语'" width="500px">
+        <el-dialog v-model="termDialogVisible" :title="termForm.id ? '编辑术语' : '添加术语'" :width="dialogWidth">
           <el-form :model="termForm" label-width="100px">
             <el-form-item label="中文术语"><el-input v-model="termForm.source_term" /></el-form-item>
             <el-form-item label="目标语言术语"><el-input v-model="termForm.target_term" /></el-form-item>
@@ -143,7 +143,7 @@
         <el-pagination style="margin-top: 16px; justify-content: center" v-model:current-page="tmPage" :page-size="20" :total="tm.total" layout="total, prev, pager, next" @current-change="fetchTm" />
 
         <!-- TM 编辑对话框 -->
-        <el-dialog v-model="tmDialogVisible" :title="tmForm.id ? '编辑记录' : '添加记录'" width="500px">
+        <el-dialog v-model="tmDialogVisible" :title="tmForm.id ? '编辑记录' : '添加记录'" :width="dialogWidth">
           <el-form :model="tmForm" label-width="80px">
             <el-form-item label="原文"><el-input v-model="tmForm.source_text" type="textarea" :rows="3" /></el-form-item>
             <el-form-item label="译文"><el-input v-model="tmForm.target_text" type="textarea" :rows="3" /></el-form-item>
@@ -241,7 +241,7 @@
         </el-table>
 
         <!-- 模型编辑对话框 -->
-        <el-dialog v-model="modelDialogVisible" :title="modelForm.id ? '编辑模型' : '添加模型'" width="550px">
+        <el-dialog v-model="modelDialogVisible" :title="modelForm.id ? '编辑模型' : '添加模型'" :width="dialogWidth">
           <el-form :model="modelForm" label-width="110px">
             <el-form-item label="模型名称">
               <el-input v-model="modelForm.name" placeholder="如：Qwen-Plus 翻译模型" />
@@ -334,6 +334,11 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '../api'
 
 const activeTab = ref('stats')
+
+// 对话框宽度自适应：小屏 90%，大屏固定宽度
+const winWidth = ref(window.innerWidth)
+const dialogWidth = computed(() => winWidth.value < 768 ? '90%' : '550px')
+window.addEventListener('resize', () => { winWidth.value = window.innerWidth })
 
 const langPairOptions = [
   { value: 'zh→en', label: '中文 → 英文' },
