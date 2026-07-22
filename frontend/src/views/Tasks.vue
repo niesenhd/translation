@@ -83,7 +83,7 @@
     </el-table>
   </el-card>
 
-  <el-dialog v-model="dialogVisible" title="新建翻译任务" width="520px">
+  <el-dialog v-model="dialogVisible" title="新建翻译任务" width="520px" @open="onDialogOpen">
     <el-form label-width="100px">
       <el-form-item label="文件">
         <el-upload :auto-upload="false" :on-change="onFileChange" :on-remove="onFileRemove" :file-list="fileList" multiple>
@@ -228,6 +228,11 @@ function onFileRemove(file) {
   if (idx > -1) {
     selectedFiles.value.splice(idx, 1)
   }
+}
+
+function onDialogOpen() {
+  fileList.value = []
+  selectedFiles.value = []
 }
 
 function onSelectionChange(rows) {
