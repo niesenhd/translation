@@ -34,21 +34,28 @@ translation/
 ## 当前阶段：P2（核心功能已完成）
 
 - [x] 项目骨架 + docker-compose（PostgreSQL / Redis / MinIO）
-- [x] FastAPI 后端骨架（admin Token 鉴权）
+- [x] FastAPI 后端 + 本地用户认证（用户名/密码登录 + pbkdf2 哈希 + HMAC 签名 Token）
 - [x] 多格式翻译：DOCX / PDF / TXT / MD / XLSX / XLS / CSV / PPTX / PPT
 - [x] Word 脚注 (footnotes) + 尾注 (endnotes) 翻译（绕过 python-docx 限制，直接操作 OOXML）
-- [x] Qwen（DashScope）官方 API 接入 + 管理后台模型配置
-- [x] Vue 3 前端（登录 / 多文件上传 / 任务列表 / 下载 / 反馈）
+- [x] Qwen（DashScope）官方 API 接入 + 管理后台多模型配置
+- [x] Vue 3 前端（登录 / 多文件批量上传 / 任务列表 / 下载 / 反馈）
 - [x] 术语库管理（手动录入 / Excel·CSV·SDLTB 导入 / 双向匹配 / 优先级 / **按段落动态过滤**）
-- [x] 翻译记忆库（TM）模糊匹配
+- [x] **文档级术语自动抽取**（翻译前一次 LLM 调用提取全文关键术语，STRICT 优先级注入，保证全文统一）
+- [x] 翻译记忆库（TM）模糊匹配 + **从已完成任务按段落对齐导入**
 - [x] 图片 OCR + 就地替换文字（PaddleOCR 3.x + PP-Structure，VL 降级）
 - [x] PDF 扫描件整页 OCR（PaddleOCR 优先，VL 降级）
-- [x] 超大文件分片调度 + 段落级并发（默认 3 路，避免 API 限流）
-- [x] 管理员后台（统计看板 / 模型配置 / 并发控制 / 文件保留策略）
-- [x] 阿拉伯语 RTL 排版
+- [x] 超大文件分片调度 + 段落级并发（默认 6 路，避免 API 限流）
+- [x] 管理员后台（统计看板 / 模型配置 / 术语库 / TM / 反馈审核 / 并发控制 / 文件保留策略）
+- [x] **两遍法精译模式**（翻译 + 法律译审复核两遍，术语一致性与法律文体更准）
+- [x] **脚注处理选项**（双语 / 仅译文 / 不翻译，仅双语模式生效）
+- [x] **翻译质量反馈闭环**（用户评分/建议 → 管理员审核 → 一键采纳录入术语库/TM）
+- [x] 阿拉伯语 RTL 排版（DOCX/PDF/PPTX 全格式 RTL 支持）
 - [x] 并发闸门安全（Redis ZSET + TTL 自愈，强杀不泄漏、beat/多 worker 不误清）
+- [x] **孤儿任务自动对账**（Beat 每 5 分钟检测卡死 RUNNING 的任务并标记 FAILED）
 - [x] API 限流防护（SDK 重试禁用 + 应用层指数退避 5-60s）
+- [x] **登录防爆破**（Redis IP 级限速：5 分钟内失败 5 次锁定 15 分钟）
 - [x] 400 拒绝预检（纯数字/符号段落跳过，不浪费 API 调用）
+- [x] **生产密钥安全守卫**（APP_ENV=production 时拒绝默认密钥启动）
 
 ## 维护变更记录
 
