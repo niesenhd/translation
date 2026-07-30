@@ -53,6 +53,11 @@ celery_app.conf.update(
             "task": "translation.reconcile_stuck_tasks",
             "schedule": crontab(minute="*/5"),
         },
+        # OA 用户同步：工作时段 9:00-18:00 每 3 小时（9:00, 12:00, 15:00, 18:00）
+        "sync-oa-users": {
+            "task": "translation.sync_oa_users",
+            "schedule": crontab(hour="9-18/3", minute=0),
+        },
     },
 )
 
@@ -61,6 +66,13 @@ celery_app.conf.update(
 def cleanup_expired_files_task() -> dict:
     """Celery Beat 定时任务：清理过期文件（覆写 + 删除）。"""
     return cleanup_expired_files().as_dict()
+
+
+@celery_app.task(name="translation.sync_oa_users")
+def sync_oa_users_task() -> dict:
+    """Celery Beat 定时任务：从律智荟 OA 同步在职人员到本地 users 表。"""
+    from app.services.oa_sync import sync_users_from_oa
+    return sync_users_from_oa()
 
 
 @celery_app.task(name="translation.reconcile_stuck_tasks")

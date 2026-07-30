@@ -134,6 +134,9 @@ services:
     restart: unless-stopped
     ports:
       - "8080:80"
+    # 启用 HTTPS 时取消下方注释，挂载 SSL 证书目录 + 映射 443
+    # volumes:
+    #   - ../deploy/ssl:/etc/nginx/ssl:ro
     depends_on:
       - backend
 

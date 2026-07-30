@@ -13,6 +13,7 @@ from app.api.terms import router as terms_router
 from app.api.tm import router as tm_router
 from app.api.feedback import router as feedback_router
 from app.api.model_configs import router as model_configs_router
+from app.api.sso import router as sso_router
 from app.core.database import Base, SessionLocal, engine, get_db
 # 显式 import 让 Base.metadata 包含所有 model 表
 from app.models import system_config as _system_config  # noqa: F401
@@ -61,6 +62,11 @@ def _ensure_columns() -> None:
         # 2026-07-09: 新增 footnote_mode（脚注处理，仅双语模式生效），默认 bilingual
         "ALTER TABLE translation_tasks "
         "ADD COLUMN IF NOT EXISTS footnote_mode VARCHAR(20) NOT NULL DEFAULT 'bilingual'",
+        # 2026-07-22: User 表新增 OA 同步字段
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(256)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(32)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS department VARCHAR(128)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS oa_id VARCHAR(64)",
     ]
     with SessionLocal() as session:
         for sql in statements:
@@ -104,3 +110,4 @@ app.include_router(terms_router, prefix="/api")
 app.include_router(tm_router, prefix="/api")
 app.include_router(feedback_router, prefix="/api")
 app.include_router(model_configs_router, prefix="/api")
+app.include_router(sso_router, prefix="/api")

@@ -67,6 +67,13 @@ class Settings(BaseSettings):
     # 文件保留天数：默认 180 天，0 表示永不过期；管理员可通过 system_config 表动态调整
     file_retention_days: int = 180
 
+    # 律智荟 OA 对接（P3）
+    oa_base_url: str = "https://e.tylaw.com.cn"
+    oa_app_key: str = ""
+    oa_app_secret: str = ""
+    # SSO 签名密钥（与律智荟约定的专用密钥）
+    oa_sso_secret: str = ""
+
     @property
     def database_url(self) -> str:
         return (

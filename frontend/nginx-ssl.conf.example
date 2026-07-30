@@ -1,0 +1,96 @@
+# nginx SSL 配置模板（HTTPS on 8080）
+#
+# 使用方法：
+# 1. 将 SSL 证书放到 /home/tianyuan/translation/deploy/ssl/ 目录
+#    - fullchain.pem  （证书链）
+#    - privkey.pem    （私钥）
+# 2. 将本文件复制为 nginx-ssl.conf 覆盖 nginx.conf（或合并）
+# 3. 修改 docker-compose.yml 挂载证书目录 + 映射 443
+# 4. docker compose build && docker compose up -d frontend
+
+server {
+    listen 8080 ssl;
+    server_name translation.tylaw.com.cn;
+
+    # SSL 证书路径（容器内路径，需在 docker-compose.yml 中挂载）
+    ssl_certificate     /etc/nginx/ssl/fullchain.pem;
+    ssl_certificate_key /etc/nginx/ssl/privkey.pem;
+
+    # SSL 安全配置
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # SPA 路由
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # 反代到后端
+    location /api/ {
+        resolver 127.0.0.11 valid=10s ipv6=off;
+        set $backend_host backend;
+        proxy_pass http://$backend_host:8000$request_uri;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        client_max_body_size 500m;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+}
+
+# ─────────────────────────────────────────────────────────────
+# SSL 证书更新方法（未来更换证书时按此操作）
+# ─────────────────────────────────────────────────────────────
+#
+# 【方式一：Let's Encrypt 自动续期（推荐）】
+#
+#   1. 在宿主机安装 certbot：
+#      sudo apt install certbot
+#
+#   2. 签发证书（DNS 验证，适合内网 / 80 端口不通的场景）：
+#      sudo certbot certonly --manual --preferred-challenges dns \
+#        -d translation.tylaw.com.cn
+#
+#   3. 证书文件位置：
+#      /etc/letsencrypt/live/translation.tylaw.com.cn/fullchain.pem
+#      /etc/letsencrypt/live/translation.tylaw.com.cn/privkey.pem
+#
+#   4. 复制到项目目录：
+#      cp /etc/letsencrypt/live/translation.tylaw.com.cn/fullchain.pem \
+#         /home/tianyuan/translation/deploy/ssl/
+#      cp /etc/letsencrypt/live/translation.tylaw.com.cn/privkey.pem \
+#         /home/tianyuan/translation/deploy/ssl/
+#
+#   5. 重启前端容器使新证书生效：
+#      cd /home/tianyuan/translation/deploy
+#      docker compose restart frontend
+#
+#   6. 自动续期（Let'sEncrypt 证书 90 天过期）：
+#      sudo crontab -e
+#      # 每月 1 号凌晨续期 + 复制 + 重启
+#      0 0 1 * * certbot renew --quiet && \
+#        cp /etc/letsencrypt/live/translation.tylaw.com.cn/fullchain.pem \
+#          /home/tianyuan/translation/deploy/ssl/ && \
+#        cp /etc/letsencrypt/live/translation.tylaw.com.cn/privkey.pem \
+#          /home/tianyuan/translation/deploy/ssl/ && \
+#        cd /home/tianyuan/translation/deploy && docker compose restart frontend
+#
+# 【方式二：自签证书 / 商业证书手动更换】
+#
+#   1. 将新的证书文件覆盖到 /home/tianyuan/translation/deploy/ssl/ 目录
+#      - fullchain.pem  （含中间证书的完整证书链）
+#      - privkey.pem    （私钥）
+#
+#   2. 重启前端容器：
+#      cd /home/tianyuan/translation/deploy && docker compose restart frontend
+#
+#   3. 验证：
+#      curl -v https://translation.tylaw.com.cn:8080/ 2>&1 | grep -E "SSL|subject|issuer"
