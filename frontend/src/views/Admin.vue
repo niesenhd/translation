@@ -304,9 +304,14 @@
 
       <!-- 用户管理 -->
       <el-tab-pane label="用户管理" name="users">
-        <div style="margin-bottom: 12px; display: flex; align-items: center; gap: 8px">
+        <div style="margin-bottom: 12px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap">
           <el-input v-model="userSearch" placeholder="搜索姓名/登录名/邮箱/手机/部门/主管合伙人" clearable style="width: 320px" @clear="fetchUsers" @keyup.enter="fetchUsers" />
           <el-button @click="fetchUsers">搜索</el-button>
+          <el-select v-model="userStatusFilter" style="width: 100px" @change="fetchUsers">
+            <el-option label="全部" value="" />
+            <el-option label="在职" value="active" />
+            <el-option label="已离职" value="inactive" />
+          </el-select>
           <el-button type="primary" @click="showUserDialog()">+ 添加用户</el-button>
           <el-button type="warning" :loading="syncing" @click="syncOA">同步OA用户</el-button>
           <span style="color: #909399; font-size: 13px">共 {{ userTotal }} 人</span>
@@ -792,6 +797,7 @@ async function triggerCleanup() {
 const users = ref([])
 const userLoading = ref(false)
 const userSearch = ref('')
+const userStatusFilter = ref('')
 const userPage = ref(1)
 const userPageSize = 50
 const userTotal = ref(0)
@@ -804,9 +810,10 @@ async function fetchUsers() {
   try {
     const params = { page: userPage.value, page_size: userPageSize }
     if (userSearch.value) params.keyword = userSearch.value
+    if (userStatusFilter.value) params.status = userStatusFilter.value
     const { data } = await api.get('/admin/users', { params })
     users.value = data
-    const { data: countData } = await api.get('/admin/users/count', { params: { keyword: userSearch.value || '' } })
+    const { data: countData } = await api.get('/admin/users/count', { params: { keyword: userSearch.value || '', status: userStatusFilter.value } })
     userTotal.value = countData.total
   } catch (e) {
     ElMessage.error('获取用户列表失败')

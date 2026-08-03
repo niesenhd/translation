@@ -293,6 +293,7 @@ class UserToggleActive(BaseModel):
 @router.get("/users", response_model=list[UserRead])
 def list_users(
     keyword: str = "",
+    status: str = "",
     page: int = 1,
     page_size: int = 50,
     user: CurrentUser = Depends(require_admin),
@@ -301,6 +302,10 @@ def list_users(
     try:
         from app.models.user import User
         stmt = select(User).order_by(User.is_active.desc(), User.username)
+        if status == "active":
+            stmt = stmt.where(User.is_active == True)
+        elif status == "inactive":
+            stmt = stmt.where(User.is_active == False)
         if keyword:
             kw = f"%{keyword}%"
             stmt = stmt.where(
@@ -334,11 +339,15 @@ def list_users(
 
 
 @router.get("/users/count")
-def count_users(keyword: str = "", user: CurrentUser = Depends(require_admin)):
+def count_users(keyword: str = "", status: str = "", user: CurrentUser = Depends(require_admin)):
     db = SessionLocal()
     try:
         from app.models.user import User
         stmt = select(func.count()).select_from(User)
+        if status == "active":
+            stmt = stmt.where(User.is_active == True)
+        elif status == "inactive":
+            stmt = stmt.where(User.is_active == False)
         if keyword:
             kw = f"%{keyword}%"
             stmt = stmt.where(
