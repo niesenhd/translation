@@ -14,7 +14,9 @@ api.interceptors.request.use((config) => {
 api.interceptors.response.use(
   (resp) => resp,
   (error) => {
-    if (error.response?.status === 401) {
+    // 登录接口的 401 不触发 logout 跳转（否则错误提示刚显示就被页面刷新清掉）
+    const isLoginRequest = error.config?.url?.includes('/auth/login')
+    if (error.response?.status === 401 && !isLoginRequest) {
       const auth = useAuthStore()
       auth.logout()
     }
