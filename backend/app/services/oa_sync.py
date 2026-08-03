@@ -147,10 +147,14 @@ def sync_users_from_oa() -> dict:
                     user.partner_id = partner_id
                     changed = True
                 if user.is_active != is_active:
-                    user.is_active = is_active
-                    changed = True
-                    if not is_active:
-                        deactivated += 1
+                    # 保护管理员：admin 账号永远不被 OA 同步标为离职
+                    if not is_active and user.is_admin:
+                        pass
+                    else:
+                        user.is_active = is_active
+                        changed = True
+                        if not is_active:
+                            deactivated += 1
                 if changed:
                     updated += 1
 
