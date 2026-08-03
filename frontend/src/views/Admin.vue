@@ -335,14 +335,17 @@
               <span v-else style="color: #909399">手动</span>
             </template>
           </el-table-column>
-          <el-table-column label="状态" width="100">
+          <el-table-column label="在职状态" width="90">
+            <template #default="{ row }">
+              <el-tag v-if="row.is_active" size="small" type="success">在职</el-tag>
+              <el-tag v-else size="small" type="info">离职</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="启用" width="80">
             <template #default="{ row }">
               <el-switch
                 :model-value="row.is_active"
                 @change="(val) => toggleUserActive(row, val)"
-                active-text="启用"
-                inactive-text="停用"
-                inline-prompt
               />
             </template>
           </el-table-column>
