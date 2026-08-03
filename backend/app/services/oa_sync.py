@@ -86,26 +86,26 @@ def sync_users_from_oa() -> dict:
     employees = _fetch_all_employees(base_url, token, ts, app_key)
     logger.info("OA 同步：拉取到 %d 条人员记录", len(employees))
 
-    # 3. 构建全员映射：loginName -> (employee_data, is_active)
+    # 3. 构建全员映射：loginName -> (employee_data, is_employed)
     all_map: dict[str, tuple[dict, bool]] = {}
     for emp in employees:
         login_name = (emp.get("loginName") or "").strip()
         if not login_name:
             continue
-        is_active = emp.get("status") == "A" and emp.get("inServiceStatus") == "在职"
-        all_map[login_name] = (emp, is_active)
+        is_employed = emp.get("status") == "A" and emp.get("inServiceStatus") == "在职"
+        all_map[login_name] = (emp, is_employed)
 
     created = 0
     updated = 0
-    deactivated = 0
+    employed_changed = 0
 
     db = SessionLocal()
     try:
         # 4a. 全量同步：在职 + 离职都写入
-        for login_name, (emp, is_active) in all_map.items():
+        for login_name, (emp, is_employed) in all_map.items():
             user = db.scalar(select(User).where(User.username == login_name))
             if user is None:
-                # 新人员：自动创建账号
+                # 新人员：自动创建账号，新用户默认启用
                 user = User(
                     username=login_name,
                     password_hash=hash_password(str(time.time())),
@@ -116,7 +116,8 @@ def sync_users_from_oa() -> dict:
                     oa_id=str(emp.get("id")) if emp.get("id") else None,
                     partner_id=str(emp.get("qyPartner")) if emp.get("qyPartner") else None,
                     partner_name=emp.get("qyPartnerName") or None,
-                    is_active=is_active,
+                    oa_employed=is_employed,
+                    is_active=is_employed,
                 )
                 db.add(user)
                 created += 1
@@ -146,15 +147,11 @@ def sync_users_from_oa() -> dict:
                 if partner_id != user.partner_id:
                     user.partner_id = partner_id
                     changed = True
-                if user.is_active != is_active:
-                    # 保护管理员：admin 账号永远不被 OA 同步标为离职
-                    if not is_active and user.is_admin:
-                        pass
-                    else:
-                        user.is_active = is_active
-                        changed = True
-                        if not is_active:
-                            deactivated += 1
+                # 只更新 OA 在职状态，不覆盖管理员手动设置的 is_active
+                if user.oa_employed != is_employed:
+                    user.oa_employed = is_employed
+                    changed = True
+                    employed_changed += 1
                 if changed:
                     updated += 1
 
@@ -169,7 +166,7 @@ def sync_users_from_oa() -> dict:
         "synced": len(all_map),
         "created": created,
         "updated": updated,
-        "deactivated": deactivated,
+        "employed_changed": employed_changed,
     }
     logger.info("OA 同步完成：%s", result)
     return result

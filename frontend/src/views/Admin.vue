@@ -337,7 +337,7 @@
           </el-table-column>
           <el-table-column label="在职状态" width="90">
             <template #default="{ row }">
-              <el-tag v-if="row.is_active" size="small" type="success">在职</el-tag>
+              <el-tag v-if="row.oa_employed" size="small" type="success">在职</el-tag>
               <el-tag v-else size="small" type="info">离职</el-tag>
             </template>
           </el-table-column>
@@ -862,7 +862,7 @@ async function syncOA() {
   syncing.value = true
   try {
     const { data } = await api.post('/admin/users/sync-oa')
-    ElMessage.success(`同步完成：共 ${data.synced} 人，新增 ${data.created}，更新 ${data.updated}，停用 ${data.deactivated}`)
+    ElMessage.success(`同步完成：共 ${data.synced} 人，新增 ${data.created}，更新 ${data.updated}，状态变动 ${data.employed_changed || 0}`)
     fetchUsers()
   } catch (e) {
     ElMessage.error(e.response?.data?.detail || '同步失败')

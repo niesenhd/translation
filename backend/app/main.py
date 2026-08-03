@@ -70,6 +70,8 @@ def _ensure_columns() -> None:
         # 2026-08-03: User 表新增主管合伙人字段
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS partner_id VARCHAR(64)",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS partner_name VARCHAR(128)",
+        # 2026-08-03: User 表新增 OA 在职状态字段（独立于 is_active）
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS oa_employed BOOLEAN NOT NULL DEFAULT true",
     ]
     with SessionLocal() as session:
         for sql in statements:

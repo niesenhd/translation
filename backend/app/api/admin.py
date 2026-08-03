@@ -278,6 +278,7 @@ class UserRead(BaseModel):
     oa_id: str | None = None
     is_admin: bool
     is_active: bool
+    oa_employed: bool = True
     created_at: str = ""
 
 class UserCreate(BaseModel):
@@ -301,11 +302,11 @@ def list_users(
     db = SessionLocal()
     try:
         from app.models.user import User
-        stmt = select(User).order_by(User.is_active.desc(), User.username)
+        stmt = select(User).order_by(User.oa_employed.desc(), User.username)
         if status == "active":
-            stmt = stmt.where(User.is_active == True)
+            stmt = stmt.where(User.oa_employed == True)
         elif status == "inactive":
-            stmt = stmt.where(User.is_active == False)
+            stmt = stmt.where(User.oa_employed == False)
         if keyword:
             kw = f"%{keyword}%"
             stmt = stmt.where(
@@ -330,6 +331,7 @@ def list_users(
                 oa_id=u.oa_id,
                 is_admin=u.is_admin,
                 is_active=u.is_active,
+                oa_employed=u.oa_employed,
                 created_at=u.created_at.isoformat() if u.created_at else "",
             )
             for u in rows
@@ -345,9 +347,9 @@ def count_users(keyword: str = "", status: str = "", user: CurrentUser = Depends
         from app.models.user import User
         stmt = select(func.count()).select_from(User)
         if status == "active":
-            stmt = stmt.where(User.is_active == True)
+            stmt = stmt.where(User.oa_employed == True)
         elif status == "inactive":
-            stmt = stmt.where(User.is_active == False)
+            stmt = stmt.where(User.oa_employed == False)
         if keyword:
             kw = f"%{keyword}%"
             stmt = stmt.where(
@@ -386,7 +388,7 @@ def create_user(payload: UserCreate, user: CurrentUser = Depends(require_admin))
         return UserRead(
             id=u.id, username=u.username, display_name=u.display_name,
             email=u.email, phone=u.phone, department=u.department, partner_name=u.partner_name, oa_id=u.oa_id,
-            is_admin=u.is_admin, is_active=u.is_active,
+            is_admin=u.is_admin, is_active=u.is_active, oa_employed=u.oa_employed,
             created_at=u.created_at.isoformat() if u.created_at else "",
         )
     finally:
@@ -413,7 +415,7 @@ def toggle_user_active(
         return UserRead(
             id=u.id, username=u.username, display_name=u.display_name,
             email=u.email, phone=u.phone, department=u.department, partner_name=u.partner_name, oa_id=u.oa_id,
-            is_admin=u.is_admin, is_active=u.is_active,
+            is_admin=u.is_admin, is_active=u.is_active, oa_employed=u.oa_employed,
             created_at=u.created_at.isoformat() if u.created_at else "",
         )
     finally:

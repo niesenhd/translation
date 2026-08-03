@@ -32,6 +32,8 @@ class User(Base):
     # 主管合伙人（律智荟 getemployees 返回）
     partner_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     partner_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # OA 在职状态（true=在职, false=离职），仅用于展示，不控制登录
+    oa_employed: Mapped[bool] = mapped_column(Boolean, default=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
