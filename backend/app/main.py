@@ -67,6 +67,9 @@ def _ensure_columns() -> None:
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(32)",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS department VARCHAR(128)",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS oa_id VARCHAR(64)",
+        # 2026-08-03: User 表新增主管合伙人字段
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS partner_id VARCHAR(64)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS partner_name VARCHAR(128)",
     ]
     with SessionLocal() as session:
         for sql in statements:

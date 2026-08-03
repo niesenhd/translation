@@ -274,6 +274,7 @@ class UserRead(BaseModel):
     email: str | None = None
     phone: str | None = None
     department: str | None = None
+    partner_name: str | None = None
     oa_id: str | None = None
     is_admin: bool
     is_active: bool
@@ -316,6 +317,7 @@ def list_users(
                 email=u.email,
                 phone=u.phone,
                 department=u.department,
+                partner_name=u.partner_name,
                 oa_id=u.oa_id,
                 is_admin=u.is_admin,
                 is_active=u.is_active,
@@ -366,7 +368,7 @@ def create_user(payload: UserCreate, user: CurrentUser = Depends(require_admin))
         db.refresh(u)
         return UserRead(
             id=u.id, username=u.username, display_name=u.display_name,
-            email=u.email, phone=u.phone, department=u.department, oa_id=u.oa_id,
+            email=u.email, phone=u.phone, department=u.department, partner_name=u.partner_name, oa_id=u.oa_id,
             is_admin=u.is_admin, is_active=u.is_active,
             created_at=u.created_at.isoformat() if u.created_at else "",
         )
@@ -393,7 +395,7 @@ def toggle_user_active(
         db.refresh(u)
         return UserRead(
             id=u.id, username=u.username, display_name=u.display_name,
-            email=u.email, phone=u.phone, department=u.department, oa_id=u.oa_id,
+            email=u.email, phone=u.phone, department=u.department, partner_name=u.partner_name, oa_id=u.oa_id,
             is_admin=u.is_admin, is_active=u.is_active,
             created_at=u.created_at.isoformat() if u.created_at else "",
         )

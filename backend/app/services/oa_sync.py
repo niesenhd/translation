@@ -114,6 +114,8 @@ def sync_users_from_oa() -> dict:
                     phone=emp.get("phone") or None,
                     department=emp.get("department") or None,
                     oa_id=str(emp.get("id")) if emp.get("id") else None,
+                    partner_id=str(emp.get("qyPartner")) if emp.get("qyPartner") else None,
+                    partner_name=emp.get("qyPartnerName") or None,
                     is_active=True,
                 )
                 db.add(user)
@@ -136,6 +138,14 @@ def sync_users_from_oa() -> dict:
                 oa_id = str(emp.get("id")) if emp.get("id") else None
                 if oa_id and user.oa_id != oa_id:
                     user.oa_id = oa_id
+                    changed = True
+                partner_name = emp.get("qyPartnerName") or None
+                if partner_name != user.partner_name:
+                    user.partner_name = partner_name
+                    changed = True
+                partner_id = str(emp.get("qyPartner")) if emp.get("qyPartner") else None
+                if partner_id != user.partner_id:
+                    user.partner_id = partner_id
                     changed = True
                 if not user.is_active:
                     user.is_active = True

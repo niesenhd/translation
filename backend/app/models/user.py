@@ -29,6 +29,9 @@ class User(Base):
     phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
     department: Mapped[str | None] = mapped_column(String(128), nullable=True)
     oa_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # 主管合伙人（律智荟 getemployees 返回）
+    partner_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    partner_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

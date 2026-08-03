@@ -315,6 +315,7 @@
           <el-table-column prop="display_name" label="姓名" width="120" />
           <el-table-column prop="username" label="登录名" width="150" />
           <el-table-column prop="department" label="部门" width="150" />
+          <el-table-column prop="partner_name" label="主管合伙人" width="120" />
           <el-table-column prop="email" label="邮箱" min-width="180" />
           <el-table-column prop="phone" label="手机" width="130" />
           <el-table-column label="管理员" width="80">
