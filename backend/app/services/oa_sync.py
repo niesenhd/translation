@@ -162,7 +162,7 @@ def sync_users_from_oa() -> dict:
         db.close()
 
     result = {
-        "synced": len(active_map),
+        "synced": len(all_map),
         "created": created,
         "updated": updated,
         "deactivated": deactivated,
