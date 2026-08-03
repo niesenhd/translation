@@ -261,3 +261,152 @@ def read_concurrency():
 def update_concurrency(payload: ConcurrencyUpdate, user: CurrentUser = Depends(require_admin)):
     _set_config_value(KEY_MAX_CONCURRENCY, str(payload.max_concurrency), user.username)
     return read_concurrency()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 用户管理
+# ══════════════════════════════════════════════════════════════════════
+
+class UserRead(BaseModel):
+    id: str
+    username: str
+    display_name: str | None = None
+    email: str | None = None
+    phone: str | None = None
+    department: str | None = None
+    oa_id: str | None = None
+    is_admin: bool
+    is_active: bool
+    created_at: str = ""
+
+class UserCreate(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=256)
+    display_name: str | None = Field(default=None, max_length=128)
+    is_admin: bool = False
+
+class UserToggleActive(BaseModel):
+    is_active: bool
+
+
+@router.get("/users", response_model=list[UserRead])
+def list_users(
+    keyword: str = "",
+    page: int = 1,
+    page_size: int = 50,
+    user: CurrentUser = Depends(require_admin),
+):
+    db = SessionLocal()
+    try:
+        from app.models.user import User
+        stmt = select(User).order_by(User.is_active.desc(), User.username)
+        if keyword:
+            stmt = stmt.where(
+                User.username.ilike(f"%{keyword}%")
+                | User.display_name.ilike(f"%{keyword}%")
+                | User.department.ilike(f"%{keyword}%")
+            )
+        stmt = stmt.offset((page - 1) * page_size).limit(page_size)
+        rows = list(db.scalars(stmt))
+        return [
+            UserRead(
+                id=u.id,
+                username=u.username,
+                display_name=u.display_name,
+                email=u.email,
+                phone=u.phone,
+                department=u.department,
+                oa_id=u.oa_id,
+                is_admin=u.is_admin,
+                is_active=u.is_active,
+                created_at=u.created_at.isoformat() if u.created_at else "",
+            )
+            for u in rows
+        ]
+    finally:
+        db.close()
+
+
+@router.get("/users/count")
+def count_users(keyword: str = "", user: CurrentUser = Depends(require_admin)):
+    db = SessionLocal()
+    try:
+        from app.models.user import User
+        stmt = select(func.count()).select_from(User)
+        if keyword:
+            stmt = stmt.where(
+                User.username.ilike(f"%{keyword}%")
+                | User.display_name.ilike(f"%{keyword}%")
+                | User.department.ilike(f"%{keyword}%")
+            )
+        total = db.scalar(stmt) or 0
+        return {"total": total}
+    finally:
+        db.close()
+
+
+@router.post("/users", response_model=UserRead, status_code=status.HTTP_201_CREATED)
+def create_user(payload: UserCreate, user: CurrentUser = Depends(require_admin)):
+    from app.core.security import hash_password
+    from app.models.user import User as UserModel
+    db = SessionLocal()
+    try:
+        existing = db.scalar(select(UserModel).where(UserModel.username == payload.username))
+        if existing:
+            raise HTTPException(status_code=409, detail="用户名已存在")
+        u = UserModel(
+            username=payload.username,
+            password_hash=hash_password(payload.password),
+            display_name=payload.display_name or payload.username,
+            is_admin=payload.is_admin,
+            is_active=True,
+        )
+        db.add(u)
+        db.commit()
+        db.refresh(u)
+        return UserRead(
+            id=u.id, username=u.username, display_name=u.display_name,
+            email=u.email, phone=u.phone, department=u.department, oa_id=u.oa_id,
+            is_admin=u.is_admin, is_active=u.is_active,
+            created_at=u.created_at.isoformat() if u.created_at else "",
+        )
+    finally:
+        db.close()
+
+
+@router.put("/users/{user_id}/active", response_model=UserRead)
+def toggle_user_active(
+    user_id: str,
+    payload: UserToggleActive,
+    current: CurrentUser = Depends(require_admin),
+):
+    db = SessionLocal()
+    try:
+        from app.models.user import User
+        u = db.get(User, user_id)
+        if u is None:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        if u.username == current.username and not payload.is_active:
+            raise HTTPException(status_code=400, detail="不能停用自己的账号")
+        u.is_active = payload.is_active
+        db.commit()
+        db.refresh(u)
+        return UserRead(
+            id=u.id, username=u.username, display_name=u.display_name,
+            email=u.email, phone=u.phone, department=u.department, oa_id=u.oa_id,
+            is_admin=u.is_admin, is_active=u.is_active,
+            created_at=u.created_at.isoformat() if u.created_at else "",
+        )
+    finally:
+        db.close()
+
+
+@router.post("/users/sync-oa")
+def trigger_oa_sync(current: CurrentUser = Depends(require_admin)):
+    """手动触发一次 OA 用户同步。"""
+    from app.services.oa_sync import sync_users_from_oa
+    try:
+        result = sync_users_from_oa()
+        return {"success": True, **result}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"同步失败：{str(exc)[:200]}")
