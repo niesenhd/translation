@@ -305,7 +305,7 @@
       <!-- 用户管理 -->
       <el-tab-pane label="用户管理" name="users">
         <div style="margin-bottom: 12px; display: flex; align-items: center; gap: 8px">
-          <el-input v-model="userSearch" placeholder="搜索用户名/姓名/部门" clearable style="width: 250px" @clear="fetchUsers" @keyup.enter="fetchUsers" />
+          <el-input v-model="userSearch" placeholder="搜索姓名/登录名/邮箱/手机/部门/主管合伙人" clearable style="width: 320px" @clear="fetchUsers" @keyup.enter="fetchUsers" />
           <el-button @click="fetchUsers">搜索</el-button>
           <el-button type="primary" @click="showUserDialog()">+ 添加用户</el-button>
           <el-button type="warning" :loading="syncing" @click="syncOA">同步OA用户</el-button>

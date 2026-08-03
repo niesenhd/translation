@@ -302,10 +302,14 @@ def list_users(
         from app.models.user import User
         stmt = select(User).order_by(User.is_active.desc(), User.username)
         if keyword:
+            kw = f"%{keyword}%"
             stmt = stmt.where(
-                User.username.ilike(f"%{keyword}%")
-                | User.display_name.ilike(f"%{keyword}%")
-                | User.department.ilike(f"%{keyword}%")
+                User.username.ilike(kw)
+                | User.display_name.ilike(kw)
+                | User.email.ilike(kw)
+                | User.phone.ilike(kw)
+                | User.department.ilike(kw)
+                | User.partner_name.ilike(kw)
             )
         stmt = stmt.offset((page - 1) * page_size).limit(page_size)
         rows = list(db.scalars(stmt))
@@ -336,10 +340,14 @@ def count_users(keyword: str = "", user: CurrentUser = Depends(require_admin)):
         from app.models.user import User
         stmt = select(func.count()).select_from(User)
         if keyword:
+            kw = f"%{keyword}%"
             stmt = stmt.where(
-                User.username.ilike(f"%{keyword}%")
-                | User.display_name.ilike(f"%{keyword}%")
-                | User.department.ilike(f"%{keyword}%")
+                User.username.ilike(kw)
+                | User.display_name.ilike(kw)
+                | User.email.ilike(kw)
+                | User.phone.ilike(kw)
+                | User.department.ilike(kw)
+                | User.partner_name.ilike(kw)
             )
         total = db.scalar(stmt) or 0
         return {"total": total}
