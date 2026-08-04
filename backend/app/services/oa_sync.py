@@ -12,7 +12,12 @@ from sqlalchemy import select
 
 from app.core.config import get_settings
 from app.core.database import SessionLocal
-from app.models.user import AUTH_SOURCE_OA, User
+from app.models.user import (
+    AUTH_SOURCE_OA,
+    RESERVED_LOCAL_ADMIN_USERNAME,
+    User,
+    is_effectively_active,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -95,9 +100,16 @@ def sync_users_from_oa() -> dict:
 
     # 3. 构建全员映射：loginName -> (employee_data, is_employed)
     all_map: dict[str, tuple[dict, bool]] = {}
+    reserved_conflict_usernames: list[str] = []
     for emp in employees:
         login_name = (emp.get("loginName") or "").strip()
         if not login_name:
+            continue
+        # admin 是翻译系统保留的本地管理员。即使 OA 存在同名人员、数据库尚无该账号，
+        # 也不得创建或更新 OA 账号，避免覆盖本地密码和管理员设置。
+        if login_name == RESERVED_LOCAL_ADMIN_USERNAME:
+            reserved_conflict_usernames.append(login_name)
+            logger.warning("OA 同步冲突：%s 是保留的本地管理员用户名，已跳过且未覆盖", login_name)
             continue
         is_employed = emp.get("status") == "A" and emp.get("inServiceStatus") == "在职"
         all_map[login_name] = (emp, is_employed)
@@ -105,7 +117,7 @@ def sync_users_from_oa() -> dict:
     created = 0
     updated = 0
     employed_changed = 0
-    conflict_usernames: list[str] = []
+    conflict_usernames: list[str] = reserved_conflict_usernames.copy()
 
     db = SessionLocal()
     try:
@@ -149,6 +161,7 @@ def sync_users_from_oa() -> dict:
                     partner_name=emp.get("qyPartnerName") or None,
                     oa_employed=is_employed,
                     is_active=is_employed,
+                    active_override=None,
                 )
                 db.add(user)
                 users_by_username[login_name] = user
@@ -187,11 +200,15 @@ def sync_users_from_oa() -> dict:
                 if partner_id != user.partner_id:
                     user.partner_id = partner_id
                     changed = True
-                # 只更新 OA 在职状态，不覆盖管理员手动设置的 is_active
+                # OA 在职状态始终同步；管理员强制状态优先于同步结果。
                 if user.oa_employed != is_employed:
                     user.oa_employed = is_employed
                     changed = True
                     employed_changed += 1
+                effective_active = is_effectively_active(user)
+                if user.is_active != effective_active:
+                    user.is_active = effective_active
+                    changed = True
                 if changed:
                     updated += 1
 

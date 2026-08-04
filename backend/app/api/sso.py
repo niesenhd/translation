@@ -16,7 +16,12 @@ from sqlalchemy import select
 from app.core.config import Settings, get_settings
 from app.core.database import SessionLocal
 from app.core.security import create_token
-from app.models.user import AUTH_SOURCE_OA, User
+from app.models.user import (
+    AUTH_SOURCE_OA,
+    RESERVED_LOCAL_ADMIN_USERNAME,
+    User,
+    is_effectively_active,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -125,14 +130,17 @@ def _consume_sso_code(code: str, settings: Settings) -> str | None:
 
 
 def _get_active_oa_user(username: str) -> User | None:
+    # Defense in depth: even malformed/restored data must never make the
+    # reserved local administrator eligible for OA SSO.
+    if username == RESERVED_LOCAL_ADMIN_USERNAME:
+        return None
     db = SessionLocal()
     try:
         user = db.scalar(select(User).where(User.username == username))
         if (
             user is None
             or (user.auth_source != AUTH_SOURCE_OA and not user.oa_id)
-            or not user.is_active
-            or not user.oa_employed
+            or not is_effectively_active(user)
         ):
             return None
         # 避免 Session 关闭后再触发属性懒加载。
@@ -165,7 +173,7 @@ def sso_login(payload: SSOLoginRequest, settings: Settings = Depends(get_setting
     if user is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"用户不存在或已离职：{payload.loginName}",
+            detail=f"用户不存在或已停用：{payload.loginName}",
         )
 
     code = _store_sso_code(user.username, settings)

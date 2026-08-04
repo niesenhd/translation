@@ -13,7 +13,13 @@ from app.core.database import SessionLocal
 from app.core.security import CurrentUser, require_admin
 from app.models.system_config import SystemConfig
 from app.models.task import TaskStatus, TranslationTask
-from app.models.user import User
+from app.models.user import (
+    AUTH_SOURCE_LOCAL,
+    AUTH_SOURCE_OA,
+    RESERVED_LOCAL_ADMIN_USERNAME,
+    User,
+    is_effectively_active,
+)
 from app.services.retention import (
     cleanup_expired_files,
     get_retention_days,
@@ -278,8 +284,10 @@ class UserRead(BaseModel):
     department: str | None = None
     partner_name: str | None = None
     oa_id: str | None = None
+    auth_source: str
     is_admin: bool
     is_active: bool
+    active_override: bool | None = None
     oa_employed: bool = True
     created_at: str = ""
 
@@ -331,8 +339,10 @@ def list_users(
                 department=u.department,
                 partner_name=u.partner_name,
                 oa_id=u.oa_id,
+                auth_source=u.auth_source,
                 is_admin=u.is_admin,
-                is_active=u.is_active,
+                is_active=is_effectively_active(u),
+                active_override=u.active_override,
                 oa_employed=u.oa_employed,
                 created_at=u.created_at.isoformat() if u.created_at else "",
             )
@@ -377,11 +387,13 @@ def create_user(payload: UserCreate, user: CurrentUser = Depends(require_admin))
         existing = db.scalar(select(UserModel).where(UserModel.username == payload.username))
         if existing:
             raise HTTPException(status_code=409, detail="用户名已存在")
+        is_reserved_admin = payload.username == RESERVED_LOCAL_ADMIN_USERNAME
         u = UserModel(
             username=payload.username,
             password_hash=hash_password(payload.password),
+            auth_source=AUTH_SOURCE_LOCAL,
             display_name=payload.display_name or payload.username,
-            is_admin=payload.is_admin,
+            is_admin=True if is_reserved_admin else payload.is_admin,
             is_active=True,
         )
         db.add(u)
@@ -390,7 +402,9 @@ def create_user(payload: UserCreate, user: CurrentUser = Depends(require_admin))
         return UserRead(
             id=u.id, username=u.username, display_name=u.display_name,
             email=u.email, phone=u.phone, department=u.department, partner_name=u.partner_name, oa_id=u.oa_id,
-            is_admin=u.is_admin, is_active=u.is_active, oa_employed=u.oa_employed,
+            auth_source=u.auth_source, is_admin=u.is_admin,
+            is_active=is_effectively_active(u), active_override=u.active_override,
+            oa_employed=u.oa_employed,
             created_at=u.created_at.isoformat() if u.created_at else "",
         )
     finally:
@@ -411,13 +425,19 @@ def toggle_user_active(
             raise HTTPException(status_code=404, detail="用户不存在")
         if u.username == current.username and not payload.is_active:
             raise HTTPException(status_code=400, detail="不能停用自己的账号")
-        u.is_active = payload.is_active
+        if u.auth_source == AUTH_SOURCE_OA or u.oa_id:
+            u.active_override = payload.is_active
+            u.is_active = is_effectively_active(u)
+        else:
+            u.is_active = payload.is_active
         db.commit()
         db.refresh(u)
         return UserRead(
             id=u.id, username=u.username, display_name=u.display_name,
             email=u.email, phone=u.phone, department=u.department, partner_name=u.partner_name, oa_id=u.oa_id,
-            is_admin=u.is_admin, is_active=u.is_active, oa_employed=u.oa_employed,
+            auth_source=u.auth_source, is_admin=u.is_admin,
+            is_active=is_effectively_active(u), active_override=u.active_override,
+            oa_employed=u.oa_employed,
             created_at=u.created_at.isoformat() if u.created_at else "",
         )
     finally:

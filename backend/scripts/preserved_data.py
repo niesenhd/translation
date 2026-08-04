@@ -26,7 +26,7 @@ from sqlalchemy import Engine, create_engine, inspect, text
 
 
 FORMAT_NAME = "translation-preserved-data"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 USERS_FILE = "users.csv"
 TERMS_FILE = "term_entries.csv"
@@ -37,6 +37,7 @@ CONFLICTS_FILE = "conflicts.csv"
 MANIFEST_FILE = "manifest.json"
 
 ENCRYPTED_PREFIX = "enc:v1:"
+RESERVED_LOCAL_ADMIN_USERNAME = "admin"
 LEGACY_MODEL_KEYS = frozenset(
     {"translation_model", "vl_model", "api_base_url", "api_key"}
 )
@@ -48,6 +49,7 @@ USERS_FIELDS = (
     "auth_source",
     "is_admin",
     "is_active",
+    "active_override",
     "display_name",
     "email",
     "phone",
@@ -300,6 +302,12 @@ def _as_bool(value: Any, field: str) -> bool:
     raise PreservedDataError(f"字段 {field} 必须为 true 或 false")
 
 
+def _as_optional_bool(value: Any, field: str) -> bool | None:
+    if value in (None, ""):
+        return None
+    return _as_bool(value, field)
+
+
 def _fernet(key: str) -> Fernet:
     if not key:
         raise PreservedDataError("解密现有密文需要 APP_DATA_ENCRYPTION_KEY")
@@ -337,6 +345,19 @@ def _transform_export_user(original: Mapping[str, Any]) -> dict[str, Any]:
     row = dict(original)
     for field in ("is_admin", "is_active", "oa_employed"):
         row[field] = _as_bool(row.get(field), field)
+    row["active_override"] = _as_optional_bool(
+        row.get("active_override"), "active_override"
+    )
+    if str(row.get("username") or "") == RESERVED_LOCAL_ADMIN_USERNAME:
+        if not row.get("password_hash"):
+            raise PreservedDataError("保留的本地 admin 账号必须包含 password_hash")
+        row.update(
+            auth_source="local",
+            is_admin=True,
+            active_override=None,
+            oa_id=None,
+        )
+        return row
     is_oa = str(row.get("auth_source") or "").lower() == "oa" or bool(row.get("oa_id"))
     if is_oa:
         row["auth_source"] = "oa"
@@ -353,6 +374,9 @@ def _account_inventory(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]
             "auth_source": str(row.get("auth_source", "")),
             "is_admin": _as_bool(row.get("is_admin"), "is_admin"),
             "is_active": _as_bool(row.get("is_active"), "is_active"),
+            "active_override": _as_optional_bool(
+                row.get("active_override"), "active_override"
+            ),
             "oa_id": _serialize(row.get("oa_id")),
         }
         for row in rows
@@ -376,13 +400,25 @@ def _fetch_export_rows(connection: Any) -> tuple[list[dict[str, Any]], ...]:
         if "auth_source" in user_columns
         else "CASE WHEN oa_id IS NULL THEN 'local' ELSE 'oa' END AS auth_source"
     )
-    preserved_user_filter = (
-        "auth_source = 'local' OR is_admin = true"
-        if "auth_source" in user_columns
-        else "oa_id IS NULL OR is_admin = true"
-    )
+    if "auth_source" in user_columns:
+        preserved_user_filter = (
+            "auth_source = 'local' OR is_admin = true "
+            f"OR username = '{RESERVED_LOCAL_ADMIN_USERNAME}'"
+        )
+        if "active_override" in user_columns:
+            preserved_user_filter += " OR active_override IS NOT NULL"
+    else:
+        preserved_user_filter = (
+            "oa_id IS NULL OR is_admin = true "
+            f"OR username = '{RESERVED_LOCAL_ADMIN_USERNAME}'"
+        )
     oa_employed_expression = (
         "oa_employed" if "oa_employed" in user_columns else "true AS oa_employed"
+    )
+    active_override_expression = (
+        "active_override"
+        if "active_override" in user_columns
+        else "NULL AS active_override"
     )
     term_normalized_expression = (
         "source_normalized"
@@ -406,7 +442,7 @@ def _fetch_export_rows(connection: Any) -> tuple[list[dict[str, Any]], ...]:
     users = connection.execute(
         text(
             "SELECT id, username, password_hash, "
-            f"{auth_source_expression}, is_admin, is_active, "
+            f"{auth_source_expression}, is_admin, is_active, {active_override_expression}, "
             "display_name, email, phone, department, oa_id, partner_id, partner_name, "
             f"{oa_employed_expression}, created_at, updated_at FROM users "
             f"WHERE {preserved_user_filter}"
@@ -635,24 +671,36 @@ def _base_values(row: Mapping[str, str]) -> dict[str, Any]:
 
 def _prepare_user(row: Mapping[str, str]) -> dict[str, Any]:
     values = _base_values(row)
+    username = _required(row, "username")
     auth_source = _required(row, "auth_source").lower()
     if auth_source not in {"local", "oa"}:
         raise PreservedDataError("字段 auth_source 取值无效")
     oa_id = _optional(row, "oa_id")
     is_oa = auth_source == "oa" or oa_id is not None
     password_hash = _optional(row, "password_hash")
-    if is_oa:
+    is_admin = _as_bool(row.get("is_admin"), "is_admin")
+    is_active = _as_bool(row.get("is_active"), "is_active")
+    active_override = _as_optional_bool(row.get("active_override"), "active_override")
+    if username == RESERVED_LOCAL_ADMIN_USERNAME:
+        if password_hash is None:
+            raise PreservedDataError("保留的本地 admin 账号必须包含 password_hash")
+        auth_source = "local"
+        oa_id = None
+        is_admin = True
+        active_override = None
+    elif is_oa:
         auth_source = "oa"
         password_hash = None
     elif password_hash is None:
         raise PreservedDataError("本地账号必须保留 password_hash")
     values.update(
         {
-            "username": _required(row, "username"),
+            "username": username,
             "password_hash": password_hash,
             "auth_source": auth_source,
-            "is_admin": _as_bool(row.get("is_admin"), "is_admin"),
-            "is_active": _as_bool(row.get("is_active"), "is_active"),
+            "is_admin": is_admin,
+            "is_active": is_active,
+            "active_override": active_override,
             "display_name": _optional(row, "display_name"),
             "email": _optional(row, "email"),
             "phone": _optional(row, "phone"),
@@ -774,10 +822,10 @@ def _lock_and_assert_empty(connection: Any, dialect_name: str) -> None:
 
 
 USER_INSERT = text(
-    "INSERT INTO users (id, username, password_hash, auth_source, is_admin, is_active, "
+    "INSERT INTO users (id, username, password_hash, auth_source, is_admin, is_active, active_override, "
     "display_name, email, phone, department, oa_id, partner_id, partner_name, oa_employed, "
     "created_at, updated_at) VALUES (:id, :username, :password_hash, :auth_source, :is_admin, "
-    ":is_active, :display_name, :email, :phone, :department, :oa_id, :partner_id, "
+    ":is_active, :active_override, :display_name, :email, :phone, :department, :oa_id, :partner_id, "
     ":partner_name, :oa_employed, :created_at, :updated_at)"
 )
 TERM_INSERT = text(

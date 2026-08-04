@@ -22,6 +22,9 @@ from scripts.preserved_data import (
     TM_FILE,
     USERS_FILE,
     PreservedDataError,
+    USERS_FIELDS,
+    _prepare_user,
+    _transform_export_user,
     export_preserved_data,
     import_preserved_data,
 )
@@ -50,7 +53,8 @@ def _create_schema(engine) -> None:
     statements = (
         """CREATE TABLE users (
             id TEXT PRIMARY KEY, username TEXT, password_hash TEXT, auth_source TEXT,
-            is_admin BOOLEAN, is_active BOOLEAN, display_name TEXT, email TEXT, phone TEXT,
+            is_admin BOOLEAN, is_active BOOLEAN, active_override BOOLEAN,
+            display_name TEXT, email TEXT, phone TEXT,
             department TEXT, oa_id TEXT, partner_id TEXT, partner_name TEXT,
             oa_employed BOOLEAN, created_at TIMESTAMP, updated_at TIMESTAMP
         )""",
@@ -82,25 +86,27 @@ def _create_schema(engine) -> None:
 
 
 def _seed_source(engine, old_key: str) -> dict[str, str]:
-    ids = {name: _id() for name in ("local", "oa_admin", "oa_user", "term_old", "term_new", "tm_old", "tm_new", "text", "vl")}
+    ids = {name: _id() for name in ("local", "oa_admin", "oa_user", "oa_override", "term_old", "term_new", "tm_old", "tm_new", "text", "vl")}
     with engine.begin() as connection:
         connection.execute(
             text(
                 "INSERT INTO users VALUES (:id, :username, :password_hash, :auth_source, "
-                ":is_admin, :is_active, :display_name, :email, :phone, :department, :oa_id, "
+                ":is_admin, :is_active, :active_override, :display_name, :email, :phone, :department, :oa_id, "
                 ":partner_id, :partner_name, :oa_employed, :created_at, :updated_at)"
             ),
             [
                 {
                     "id": ids["local"], "username": "local-admin", "password_hash": "hash-local",
                     "auth_source": "local", "is_admin": True, "is_active": True,
+                    "active_override": None,
                     "display_name": "Local", "email": None, "phone": None, "department": None,
                     "oa_id": None, "partner_id": None, "partner_name": None,
                     "oa_employed": True, "created_at": OLDER, "updated_at": NOW,
                 },
                 {
                     "id": ids["oa_admin"], "username": "oa-admin", "password_hash": "must-clear",
-                    "auth_source": "local", "is_admin": True, "is_active": True,
+                    "auth_source": "local", "is_admin": True, "is_active": False,
+                    "active_override": False,
                     "display_name": "OA Admin", "email": "admin@example.com", "phone": "1",
                     "department": "Legal", "oa_id": "oa-1", "partner_id": "p-1",
                     "partner_name": "Partner", "oa_employed": True,
@@ -109,9 +115,18 @@ def _seed_source(engine, old_key: str) -> dict[str, str]:
                 {
                     "id": ids["oa_user"], "username": "oa-user", "password_hash": "excluded",
                     "auth_source": "oa", "is_admin": False, "is_active": True,
+                    "active_override": None,
                     "display_name": "OA User", "email": None, "phone": None, "department": None,
                     "oa_id": "oa-2", "partner_id": None, "partner_name": None,
                     "oa_employed": True, "created_at": OLDER, "updated_at": NOW,
+                },
+                {
+                    "id": ids["oa_override"], "username": "oa-forced", "password_hash": None,
+                    "auth_source": "oa", "is_admin": False, "is_active": True,
+                    "active_override": True,
+                    "display_name": "OA Forced", "email": None, "phone": None, "department": None,
+                    "oa_id": "oa-3", "partner_id": None, "partner_name": None,
+                    "oa_employed": False, "created_at": OLDER, "updated_at": NOW,
                 },
             ],
         )
@@ -168,6 +183,52 @@ def _csv_rows(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
+def _reserved_admin_bundle_row(password_hash: str = "hash-admin") -> dict[str, str]:
+    row = {field: "" for field in USERS_FIELDS}
+    row.update(
+        id=_id(),
+        username="admin",
+        password_hash=password_hash,
+        auth_source="oa",
+        is_admin="false",
+        is_active="false",
+        active_override="false",
+        oa_id="oa-admin",
+        oa_employed="false",
+        created_at=OLDER.isoformat(),
+        updated_at=NOW.isoformat(),
+    )
+    return row
+
+
+def test_reserved_admin_is_normalized_without_changing_password_hash() -> None:
+    exported = _transform_export_user(_reserved_admin_bundle_row())
+
+    assert exported["password_hash"] == "hash-admin"
+    assert exported["auth_source"] == "local"
+    assert exported["oa_id"] is None
+    assert exported["active_override"] is None
+    assert exported["is_admin"] is True
+    assert exported["is_active"] is False
+
+    restored = _prepare_user(_reserved_admin_bundle_row())
+    assert restored["password_hash"] == "hash-admin"
+    assert restored["auth_source"] == "local"
+    assert restored["oa_id"] is None
+    assert restored["active_override"] is None
+    assert restored["is_admin"] is True
+    assert restored["is_active"] is False
+
+
+def test_reserved_admin_without_password_hash_is_rejected() -> None:
+    row = _reserved_admin_bundle_row(password_hash="")
+
+    with pytest.raises(PreservedDataError, match="admin 账号必须包含 password_hash"):
+        _transform_export_user(row)
+    with pytest.raises(PreservedDataError, match="admin 账号必须包含 password_hash"):
+        _prepare_user(row)
+
+
 def test_round_trip_is_filtered_deduplicated_and_rotates_model_keys(tmp_path: Path) -> None:
     old_key = Fernet.generate_key().decode()
     new_key = Fernet.generate_key().decode()
@@ -186,7 +247,7 @@ def test_round_trip_is_filtered_deduplicated_and_rotates_model_keys(tmp_path: Pa
         USERS_FILE, TERMS_FILE, TM_FILE, MODEL_CONFIGS_FILE,
         LEGACY_MODEL_CONFIG_FILE, CONFLICTS_FILE,
     }
-    assert manifest["files"][USERS_FILE]["rows"] == 2
+    assert manifest["files"][USERS_FILE]["rows"] == 3
     assert manifest["files"][TERMS_FILE]["rows"] == 1
     assert manifest["files"][TM_FILE]["rows"] == 1
     assert manifest["files"][MODEL_CONFIGS_FILE]["rows"] == 2
@@ -197,7 +258,7 @@ def test_round_trip_is_filtered_deduplicated_and_rotates_model_keys(tmp_path: Pa
         "translation_memories": {"en→zh": 1},
     }
     assert [account["username"] for account in manifest["accounts"]] == [
-        "local-admin", "oa-admin"
+        "local-admin", "oa-admin", "oa-forced"
     ]
     assert os.stat(bundle).st_mode & 0o777 == 0o700
     for filename, metadata in manifest["files"].items():
@@ -209,6 +270,8 @@ def test_round_trip_is_filtered_deduplicated_and_rotates_model_keys(tmp_path: Pa
     assert users["local-admin"]["password_hash"] == "hash-local"
     assert users["oa-admin"]["password_hash"] == ""
     assert users["oa-admin"]["auth_source"] == "oa"
+    assert users["oa-admin"]["active_override"] == "false"
+    assert users["oa-forced"]["active_override"] == "true"
     assert _csv_rows(bundle / TERMS_FILE)[0]["target_term"] == "合同"
     memory = _csv_rows(bundle / TM_FILE)[0]
     assert memory["target_text"] == "你好"
@@ -226,7 +289,7 @@ def test_round_trip_is_filtered_deduplicated_and_rotates_model_keys(tmp_path: Pa
         target, bundle, app_data_encryption_key=new_key
     )
     assert result == {
-        "users": 2,
+        "users": 3,
         "term_entries": 1,
         "translation_memories": 1,
         "model_configs": 2,
@@ -241,6 +304,8 @@ def test_round_trip_is_filtered_deduplicated_and_rotates_model_keys(tmp_path: Pa
         assert restored_users["local-admin"].password_hash == "hash-local"
         assert restored_users["oa-admin"].password_hash is None
         assert restored_users["oa-admin"].auth_source == "oa"
+        assert bool(restored_users["oa-admin"].active_override) is False
+        assert bool(restored_users["oa-forced"].active_override) is True
         assert connection.execute(text("SELECT target_term FROM term_entries")).scalar_one() == "合同"
         restored_memory = connection.execute(
             text("SELECT target_text, task_id FROM translation_memories")

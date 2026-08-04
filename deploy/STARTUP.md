@@ -35,7 +35,7 @@ chmod 600 .env
 
 迁移到全新空库时，必须使用 `backend/scripts/preserved_data.py` 导出、校验并恢复保留数据。保留范围包括：
 
-- 允许保留的本地/管理员账号及密码哈希；普通 OA 人员由 `getemployees` 重新同步；
+- 允许保留的本地/管理员账号及密码哈希，以及带管理员强制启停状态的 OA 账号；其余普通 OA 人员由 `getemployees` 重新同步；
 - 全部法律术语库和翻译记忆库；
 - 全部 `model_configs`，包括模型 ID、API 地址、API Key、模型类型、启用状态；
 - 旧版 `system_config` 中的 `translation_model`、`vl_model`、`api_base_url`、`api_key`。
@@ -108,6 +108,10 @@ curl -X POST http://127.0.0.1:8000/api/admin/users \
 
 随后访问 `http://localhost:8080`，使用刚创建的用户名和密码登录。`APP_ADMIN_TOKEN` 只作紧急 API
 兜底，不应填入前端登录页，也不应作为日常用户凭据。
+
+`admin` 是系统保留的本地管理员用户名：创建时会强制设为本地管理员，并保留本地密码登录方式。
+即使律智荟中存在同名人员，OA 同步也会无条件跳过，不会创建 OA `admin`，也不会覆盖现有账号的
+密码哈希、资料、管理员权限或启停状态。升级现有环境时不得把该账号转换为 OA 账号。
 
 ## 5. 直接调用 API
 

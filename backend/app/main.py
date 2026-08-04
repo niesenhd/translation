@@ -14,6 +14,7 @@ from app.api.tm import router as tm_router
 from app.api.feedback import router as feedback_router
 from app.api.model_configs import router as model_configs_router
 from app.api.sso import router as sso_router
+from app.api.user_exports import router as user_exports_router
 from app.core.config import get_settings
 from app.core.database import get_db
 
@@ -62,3 +63,4 @@ app.include_router(tm_router, prefix="/api")
 app.include_router(feedback_router, prefix="/api")
 app.include_router(model_configs_router, prefix="/api")
 app.include_router(sso_router, prefix="/api")
+app.include_router(user_exports_router, prefix="/api")

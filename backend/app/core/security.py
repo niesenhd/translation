@@ -3,7 +3,7 @@
 - 用户名/密码登录：POST /api/auth/login 校验密码后签发 HMAC 签名 token（无状态，
   载荷含 username + 过期时间，用 app_secret_key 签名）。
 - 兼容：原静态 admin token 仍可用作紧急超级管理员入口。
-- OA 用户仅能通过 SSO 换取本站会话 token；离职状态会在每次鉴权时复查。
+- OA 用户仅能通过 SSO 换取本站会话 token；每次鉴权都复查最终启用状态。
 """
 import base64
 import hashlib
@@ -98,11 +98,11 @@ def _authenticate_admin(token: str, settings: Settings) -> Optional[CurrentUser]
 
 
 def _authenticate_session(token: str, settings: Settings) -> Optional[CurrentUser]:
-    """签名 token → 查 users 表，并实时校验账号及 OA 在职状态。"""
+    """签名 token → 查 users 表，并实时校验账号的最终启用状态。"""
     username = _verify_token(token, settings)
     if not username:
         return None
-    from app.models.user import AUTH_SOURCE_OA, User
+    from app.models.user import User, is_effectively_active
     from app.core.database import SessionLocal
     from sqlalchemy import select as _sel
     db = SessionLocal()
@@ -110,10 +110,7 @@ def _authenticate_session(token: str, settings: Settings) -> Optional[CurrentUse
         user = db.scalar(_sel(User).where(User.username == username))
     finally:
         db.close()
-    if user is None or not user.is_active:
-        return None
-    is_oa_account = user.auth_source == AUTH_SOURCE_OA or bool(user.oa_id)
-    if is_oa_account and not user.oa_employed:
+    if user is None or not is_effectively_active(user):
         return None
     return CurrentUser(username=user.username, is_admin=user.is_admin)
 

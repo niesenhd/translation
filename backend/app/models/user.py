@@ -11,6 +11,7 @@ from app.models.base import TimestampMixin
 
 AUTH_SOURCE_LOCAL = "local"
 AUTH_SOURCE_OA = "oa"
+RESERVED_LOCAL_ADMIN_USERNAME = "admin"
 
 
 class User(TimestampMixin, Base):
@@ -43,6 +44,8 @@ class User(TimestampMixin, Base):
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     # 是否启用（禁用后无法登录）
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
+    # OA 账号的管理员强制状态；NULL 表示跟随 OA 在职状态。
+    active_override: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     # 显示名（可选，用于界面展示）
     display_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # OA 同步字段（律智荟 getemployees 返回）
@@ -53,5 +56,15 @@ class User(TimestampMixin, Base):
     # 主管合伙人（律智荟 getemployees 返回）
     partner_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     partner_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    # OA 在职状态（OA 用户每次鉴权都会复查，false 时现有会话立即失效）
+    # OA 在职状态；同步时用于计算未被管理员覆盖的最终启用状态。
     oa_employed: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
+
+
+def is_effectively_active(user: User) -> bool:
+    """返回用户的实时最终启用状态。"""
+    is_oa_account = user.auth_source == AUTH_SOURCE_OA or bool(user.oa_id)
+    if not is_oa_account:
+        return user.is_active
+    if user.active_override is not None:
+        return user.active_override
+    return user.oa_employed

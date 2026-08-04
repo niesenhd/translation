@@ -5,7 +5,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HOME=/home/app \
     PIP_NO_CACHE_DIR=1 \
     PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple/ \
-    PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+    PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn \
+    UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple/
 
 WORKDIR /app
 

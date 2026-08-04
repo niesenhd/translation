@@ -10,19 +10,30 @@ creds.txt 每行 "username password [is_admin]"（is_admin 为可选，值 admin
 
 注意：密码仅用于此处计算哈希入库，不落盘、不入 git。
 """
-import sys
+import argparse
 from pathlib import Path
 
 from sqlalchemy import select
 
 from app.core.database import SessionLocal
 from app.core.security import hash_password
-from app.models.user import User
+from app.models.user import (
+    AUTH_SOURCE_LOCAL,
+    RESERVED_LOCAL_ADMIN_USERNAME,
+    User,
+)
 
 
 def upsert(db, username: str, password: str, is_admin: bool, reset: bool) -> str:
+    is_reserved_admin = username == RESERVED_LOCAL_ADMIN_USERNAME
+    is_admin = is_admin or is_reserved_admin
     existing = db.scalar(select(User).where(User.username == username))
     if existing:
+        if is_reserved_admin:
+            existing.auth_source = AUTH_SOURCE_LOCAL
+            existing.is_admin = True
+            existing.oa_id = None
+            existing.active_override = None
         if reset:
             existing.password_hash = hash_password(password)
             existing.is_admin = is_admin
@@ -32,6 +43,7 @@ def upsert(db, username: str, password: str, is_admin: bool, reset: bool) -> str
     db.add(User(
         username=username,
         password_hash=hash_password(password),
+        auth_source=AUTH_SOURCE_LOCAL,
         is_admin=is_admin,
         is_active=True,
         display_name=username,
@@ -40,23 +52,22 @@ def upsert(db, username: str, password: str, is_admin: bool, reset: bool) -> str
 
 
 def main() -> int:
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    flags = {a for a in sys.argv[1:] if a.startswith("--")}
-    reset = "--reset" in flags
+    parser = argparse.ArgumentParser(description="创建或补齐本地登录账号")
+    parser.add_argument("credential_files", nargs="*")
+    parser.add_argument("--admin-pass", default="")
+    parser.add_argument("--reset", action="store_true")
+    args = parser.parse_args()
 
     db = SessionLocal()
     created = 0
     try:
         # 额外管理员账号
-        if "--admin-pass" in sys.argv:
-            i = sys.argv.index("--admin-pass")
-            pw = sys.argv[i + 1] if i + 1 < len(sys.argv) else ""
-            if pw:
-                msg = upsert(db, "admin", pw, is_admin=True, reset=reset)
-                print(msg)
-                created += 1
+        if args.admin_pass:
+            msg = upsert(db, "admin", args.admin_pass, is_admin=True, reset=args.reset)
+            print(msg)
+            created += 1
 
-        for path in args:
+        for path in args.credential_files:
             for line in Path(path).read_text(encoding="utf-8").splitlines():
                 line = line.strip()
                 if not line or line.startswith("#"):
@@ -66,7 +77,7 @@ def main() -> int:
                     continue
                 username, password = parts[0], parts[1]
                 is_admin = (len(parts) > 2 and parts[2].lower() == "admin")
-                msg = upsert(db, username, password, is_admin, reset)
+                msg = upsert(db, username, password, is_admin, args.reset)
                 print(msg)
                 created += 1
         db.commit()

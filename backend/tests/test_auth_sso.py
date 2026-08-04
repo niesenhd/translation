@@ -79,15 +79,15 @@ def _settings() -> Settings:
     )
 
 
-def _signed_payload(settings: Settings) -> sso.SSOLoginRequest:
+def _signed_payload(settings: Settings, username: str = "zhangsan") -> sso.SSOLoginRequest:
     timestamp = int(time.time() * 1000)
     digest = hmac.new(
         settings.oa_sso_secret.encode(),
-        f"zhangsan{timestamp}".encode(),
+        f"{username}{timestamp}".encode(),
         hashlib.sha256,
     ).digest()
     return sso.SSOLoginRequest(
-        loginName="zhangsan",
+        loginName=username,
         timestamp=timestamp,
         sign=base64.b64encode(digest).decode(),
     )
@@ -172,25 +172,126 @@ def test_oa_account_cannot_use_local_password_login(monkeypatch) -> None:
     assert exc_info.value.status_code == 401
 
 
+def test_reserved_admin_can_use_only_its_existing_local_password(monkeypatch) -> None:
+    settings = _settings()
+    existing_hash = security.hash_password("existing-admin-password")
+    user = SimpleNamespace(
+        username="admin",
+        auth_source=AUTH_SOURCE_LOCAL,
+        is_active=True,
+        password_hash=existing_hash,
+        oa_id=None,
+        is_admin=True,
+        display_name="管理员",
+    )
+    monkeypatch.setattr(auth, "SessionLocal", lambda: FakeSession(user))
+    monkeypatch.setattr(auth, "get_settings", lambda: settings)
+    monkeypatch.setattr(auth, "_check_login_locked", lambda _ip: None)
+    monkeypatch.setattr(auth, "_record_login_failure", lambda _ip: None)
+    monkeypatch.setattr(auth, "_clear_login_failures", lambda _ip: None)
+    request = SimpleNamespace(headers={}, client=SimpleNamespace(host="127.0.0.1"))
+
+    result = auth.login(
+        auth.LoginRequest(username="admin", password="existing-admin-password"),
+        request,
+    )
+
+    assert result.username == "admin"
+    assert result.is_admin is True
+    assert result.token.count(".") == 1
+
+
+def test_reserved_local_admin_is_rejected_by_oa_sso(monkeypatch) -> None:
+    settings = _settings()
+    redis = FakeRedis()
+    user = SimpleNamespace(
+        username="admin",
+        # SSO must reject the reserved name even if malformed/restored data
+        # still carries an OA binding and would otherwise pass OA checks.
+        auth_source=AUTH_SOURCE_OA,
+        is_active=True,
+        password_hash="existing-hash",
+        oa_id="oa-admin",
+        oa_employed=True,
+        active_override=None,
+        is_admin=True,
+        display_name="管理员",
+    )
+    monkeypatch.setattr(sso, "SessionLocal", lambda: FakeSession(user))
+    monkeypatch.setattr(sso, "_redis_client", lambda _settings: redis)
+
+    with pytest.raises(HTTPException) as exc_info:
+        sso.sso_login(_signed_payload(settings, "admin"), settings)
+
+    assert exc_info.value.status_code == 404
+    assert not any(key.startswith("sso:code:") for key in redis.values)
+
+
 @pytest.mark.parametrize(
-    ("auth_source", "oa_employed", "accepted"),
-    [(AUTH_SOURCE_OA, False, False), (AUTH_SOURCE_OA, True, True), (AUTH_SOURCE_LOCAL, False, True)],
+    ("auth_source", "is_active", "oa_employed", "active_override", "accepted"),
+    [
+        (AUTH_SOURCE_OA, True, True, None, True),
+        (AUTH_SOURCE_OA, True, False, None, False),
+        (AUTH_SOURCE_OA, False, False, True, True),
+        (AUTH_SOURCE_OA, True, True, False, False),
+        (AUTH_SOURCE_LOCAL, True, False, None, True),
+        (AUTH_SOURCE_LOCAL, False, True, True, False),
+    ],
 )
-def test_session_rechecks_oa_employment(
-    monkeypatch, auth_source: str, oa_employed: bool, accepted: bool
+def test_session_rechecks_effective_active_state(
+    monkeypatch,
+    auth_source: str,
+    is_active: bool,
+    oa_employed: bool,
+    active_override: bool | None,
+    accepted: bool,
 ) -> None:
     user = SimpleNamespace(
         username="zhangsan",
         is_admin=False,
-        is_active=True,
+        is_active=is_active,
         auth_source=auth_source,
         oa_employed=oa_employed,
+        active_override=active_override,
         oa_id="oa-123" if auth_source == AUTH_SOURCE_OA else None,
     )
     monkeypatch.setattr(security, "_verify_token", lambda _token, _settings: "zhangsan")
     monkeypatch.setattr(database, "SessionLocal", lambda: FakeSession(user))
 
     result = security._authenticate_session("token", _settings())
+    assert (result is not None) is accepted
+
+
+@pytest.mark.parametrize(
+    ("auth_source", "oa_employed", "active_override", "accepted"),
+    [
+        (AUTH_SOURCE_OA, False, None, False),
+        (AUTH_SOURCE_OA, False, True, True),
+        (AUTH_SOURCE_OA, True, False, False),
+        (AUTH_SOURCE_LOCAL, True, True, False),
+    ],
+)
+def test_sso_rechecks_effective_active_state(
+    monkeypatch,
+    auth_source: str,
+    oa_employed: bool,
+    active_override: bool | None,
+    accepted: bool,
+) -> None:
+    user = SimpleNamespace(
+        username="zhangsan",
+        is_admin=False,
+        display_name="张三",
+        is_active=True,
+        auth_source=auth_source,
+        oa_employed=oa_employed,
+        active_override=active_override,
+        oa_id="oa-123" if auth_source == AUTH_SOURCE_OA else None,
+    )
+    monkeypatch.setattr(sso, "SessionLocal", lambda: FakeSession(user))
+
+    result = sso._get_active_oa_user("zhangsan")
+
     assert (result is not None) is accepted
 
 
@@ -237,6 +338,7 @@ def test_oa_sync_creates_sso_only_account_without_local_password(monkeypatch) ->
     assert len(db.added) == 1
     assert db.added[0].auth_source == AUTH_SOURCE_OA
     assert db.added[0].password_hash is None
+    assert db.added[0].active_override is None
 
 
 def test_oa_sync_converts_existing_oa_admin_to_sso_only(monkeypatch) -> None:
@@ -252,6 +354,8 @@ def test_oa_sync_converts_existing_oa_admin_to_sso_only(monkeypatch) -> None:
         partner_id=None,
         partner_name=None,
         oa_employed=True,
+        active_override=None,
+        is_active=True,
         is_admin=True,
     )
     db = FakeOASession(existing)

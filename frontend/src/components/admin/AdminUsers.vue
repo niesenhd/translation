@@ -9,6 +9,7 @@
     </el-select>
     <el-button type="primary" @click="showUserDialog">+ 添加用户</el-button>
     <el-button type="warning" :loading="syncing" @click="syncOA">同步OA用户</el-button>
+    <el-button :loading="exporting" @click="exportUsers">导出全部用户 CSV</el-button>
     <span class="muted count">共 {{ userTotal }} 人</span>
   </div>
 
@@ -27,22 +28,28 @@
     </el-table-column>
     <el-table-column label="来源" width="80">
       <template #default="{ row }">
-        <el-tag v-if="row.oa_id" size="small" type="info">OA同步</el-tag>
+        <el-tag v-if="isOaUser(row)" size="small" type="info">OA同步</el-tag>
         <span v-else class="muted">手动</span>
       </template>
     </el-table-column>
-    <el-table-column label="在职状态" width="90">
+    <el-table-column label="OA在职" width="90">
       <template #default="{ row }">
-        <el-tag v-if="row.oa_employed" size="small" type="success">在职</el-tag>
-        <el-tag v-else size="small" type="info">离职</el-tag>
+        <el-tag v-if="isOaUser(row) && row.oa_employed" size="small" type="success">在职</el-tag>
+        <el-tag v-else-if="isOaUser(row)" size="small" type="info">离职</el-tag>
+        <span v-else class="muted">-</span>
       </template>
     </el-table-column>
-    <el-table-column label="启用" width="80">
+    <el-table-column label="账户启用" width="170">
       <template #default="{ row }">
-        <el-switch
-          :model-value="row.is_active"
-          @change="value => toggleUserActive(row, value)"
-        />
+        <div class="active-control">
+          <el-switch
+            :model-value="row.is_active"
+            @change="value => toggleUserActive(row, value)"
+          />
+          <el-tag v-if="row.active_override === true" size="small" type="success">强制启用</el-tag>
+          <el-tag v-else-if="row.active_override === false" size="small" type="danger">强制停用</el-tag>
+          <el-tag v-else-if="isOaUser(row)" size="small" type="info">跟随OA</el-tag>
+        </div>
       </template>
     </el-table-column>
   </el-table>
@@ -79,6 +86,7 @@ import { onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import api from '../../api'
 import { persistBooleanToggle } from '../../toggle'
+import { downloadAllUsersCsv } from '../../user-export'
 
 defineProps({
   dialogWidth: {
@@ -96,12 +104,17 @@ const userPageSize = 50
 const userTotal = ref(0)
 const userDialogVisible = ref(false)
 const syncing = ref(false)
+const exporting = ref(false)
 const userForm = reactive({ username: '', password: '', display_name: '', is_admin: false })
 
 watch([userSearch, userStatusFilter], () => { userPage.value = 1 }, { flush: 'sync' })
 
 function showError(error, fallback) {
   ElMessage.error(error.response?.data?.detail || fallback)
+}
+
+function isOaUser(row) {
+  return row.auth_source === 'oa' || Boolean(row.oa_id)
 }
 
 async function fetchUsers() {
@@ -149,14 +162,31 @@ async function saveUser() {
 async function toggleUserActive(row, value) {
   try {
     row.is_active = value
+    let updatedUser
     await persistBooleanToggle(
       row,
       'is_active',
-      nextValue => api.put(`/admin/users/${row.id}/active`, { is_active: nextValue }),
+      async nextValue => {
+        const { data } = await api.put(`/admin/users/${row.id}/active`, { is_active: nextValue })
+        updatedUser = data
+      },
     )
+    if (updatedUser) Object.assign(row, updatedUser)
     ElMessage.success(value ? '已启用' : '已停用')
   } catch (error) {
     showError(error, '操作失败')
+  }
+}
+
+async function exportUsers() {
+  exporting.value = true
+  try {
+    await downloadAllUsersCsv(api)
+    ElMessage.success('全部用户 CSV 导出成功')
+  } catch (error) {
+    showError(error, '导出用户失败')
+  } finally {
+    exporting.value = false
   }
 }
 
@@ -218,5 +248,11 @@ onMounted(fetchUsers)
   margin-left: 10px;
   color: #909399;
   font-size: 12px;
+}
+
+.active-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 </style>

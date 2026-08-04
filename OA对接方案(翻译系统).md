@@ -34,7 +34,8 @@
 
 ① SSO 登录：律智荟服务器 POST 调我们的接口；响应只返回带 60 秒一次性 code 的绝对 redirect_url，
    浏览器打开后由前端调用 /api/sso/exchange 兑换登录 token
-② 用户同步：我们定时调律智荟 getemployees，同步在职人员到本地 users 表
+② 用户同步：我们定时调律智荟 getemployees，同步全员资料及 OA 在职状态到本地 users 表；
+   未设置管理员覆盖时，最终启停跟随 OA；管理员可强制启用或强制停用且后续同步不覆盖
 ```
 
 ---
@@ -131,7 +132,7 @@
 | 401 | `签名校验失败` | HMAC-SHA256 验证不通过 |
 | 401 | `时间戳已过期` | timestamp 与服务器时间差超过 5 分钟（300 秒） |
 | 401 | `SSO 请求已使用或正在处理` | 同一签名请求在防重放窗口内再次提交 |
-| 404 | `用户不存在或已离职：{loginName}` | 用户不存在、非 OA 身份、`is_active=false` 或 `oa_employed=false` |
+| 404 | `用户不存在或已停用：{loginName}` | 用户不存在、非 OA 身份，或最终启用状态为停用；管理员强制启用可作为离职账号的明确例外 |
 | 500 | `SSO 密钥未配置` / `PUBLIC_BASE_URL 未配置` | 生产配置缺失 |
 | 503 | `SSO 服务暂不可用，请稍后重试` | Redis 防重放或一次性 code 存储不可用（安全失败） |
 
@@ -261,8 +262,10 @@ Celery Beat 定时任务（工作时段 9:00-18:00，每 3 小时同步一次）
   │
   ├── 4. 与本地 users 表比对：
   │      - 新人员 → 自动创建 OA 专用账号（不创建本地密码，只能走 SSO）
+  │      - loginName 精确为 admin → 无条件跳过，不创建、不绑定、不更新
   │      - 已有人员 → 更新姓名/邮箱/部门
-  │      - 离职人员 → oa_employed=False（不删除，保留历史数据；is_active 保留本地管理语义）
+  │      - 离职人员 → oa_employed=False（不删除）；无管理员覆盖时最终状态自动停用
+  │      - 管理员强制启用/停用 → active_override=True/False，后续 OA 同步不得覆盖
   │
   └── 5. 记录同步日志
 ```
@@ -301,7 +304,10 @@ Celery Beat 定时任务（工作时段 9:00-18:00，每 3 小时同步一次）
 | Phone | phone | 手机号 |
 | Department | department | 部门 |
 | Category | — | 当前版本不落库；后续如启用 OA 角色映射需另行确认规则 |
-| Status="A" + InServiceStatus="在职" | oa_employed=True | OA 在职状态；其他情况为 false，SSO 与普通登录鉴权均拒绝 OA 离职账号 |
+| Status="A" + InServiceStatus="在职" | oa_employed=True | OA 原始在职状态；其他情况为 false。最终启用状态优先采用管理员覆盖，否则跟随该字段 |
+
+> `admin` 是翻译系统保留的本地管理员用户名，只允许本地密码登录。律智荟中同名人员不参与同步或 SSO，
+> 不得覆盖本地 `admin` 的密码哈希、资料、`auth_source`、管理员权限或启停状态。
 
 ---
 
