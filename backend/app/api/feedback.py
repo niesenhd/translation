@@ -56,7 +56,11 @@ class FeedbackPage(BaseModel):
 def create_feedback(payload: FeedbackCreate, user: CurrentUser = Depends(get_current_user)):
     db = SessionLocal()
     try:
-        task = db.get(TranslationTask, payload.task_id)
+        task_query = select(TranslationTask).where(TranslationTask.id == payload.task_id)
+        if not user.is_admin:
+            task_query = task_query.where(TranslationTask.owner == user.username)
+        task = db.scalar(task_query)
+        # 权限条件与 task_id 在同一 SQL 中执行；统一返回 404，避免泄露任务是否存在。
         if task is None:
             raise HTTPException(status_code=404, detail="任务不存在")
 
@@ -200,9 +204,8 @@ def adopt_feedback(
     user: CurrentUser = Depends(require_admin),
 ):
     """采纳反馈：可选把建议录入术语库(strict) / TM(source=feedback)，并置 ADOPTED。"""
-    from app.models.term import TermEntry, TermPriority
-    from app.models.translation_memory import TranslationMemory
-    from sqlalchemy import func as _func
+    from app.models.term import TermPriority
+    from app.services.terminology_repository import upsert_term, upsert_translation_memory
 
     db = SessionLocal()
     try:
@@ -212,50 +215,29 @@ def adopt_feedback(
 
         if payload.to_term:
             t = payload.to_term
-            # 术语去重：同 lang_pair + source_term 覆盖
-            exist = db.scalar(
-                select(TermEntry).where(
-                    TermEntry.lang_pair == t.lang_pair,
-                    _func.lower(TermEntry.source_term) == t.source_term.strip().lower(),
-                )
+            upsert_term(
+                db,
+                source_term=t.source_term,
+                target_term=t.target_term,
+                lang_pair=t.lang_pair,
+                domain=t.domain,
+                priority=TermPriority.STRICT,
+                note=None,
+                username=user.username,
             )
-            if exist:
-                exist.target_term = t.target_term
-                exist.priority = TermPriority.STRICT
-                if t.domain:
-                    exist.domain = t.domain
-            else:
-                db.add(TermEntry(
-                    id=str(uuid.uuid4()),
-                    source_term=t.source_term,
-                    target_term=t.target_term,
-                    lang_pair=t.lang_pair,
-                    domain=t.domain,
-                    priority=TermPriority.STRICT,
-                    updated_by=user.username,
-                ))
 
         if payload.to_tm:
             m = payload.to_tm
-            exist = db.scalar(
-                select(TranslationMemory).where(
-                    TranslationMemory.lang_pair == m.lang_pair,
-                    _func.lower(_func.btrim(TranslationMemory.source_text)) == m.source_text.strip().lower(),
-                )
+            upsert_translation_memory(
+                db,
+                source_text=m.source_text,
+                target_text=m.target_text,
+                lang_pair=m.lang_pair,
+                source="feedback",
+                domain=None,
+                task_id=None,
+                username=user.username,
             )
-            if exist:
-                exist.target_text = m.target_text
-                exist.source = "feedback"
-                exist.updated_by = user.username
-            else:
-                db.add(TranslationMemory(
-                    id=str(uuid.uuid4()),
-                    source_text=m.source_text,
-                    target_text=m.target_text,
-                    lang_pair=m.lang_pair,
-                    source="feedback",
-                    updated_by=user.username,
-                ))
 
         entry.status = FeedbackStatus.ADOPTED
         entry.reviewed_by = user.username

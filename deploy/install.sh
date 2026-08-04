@@ -10,9 +10,8 @@
 #  - v2: Docker 官方源在国内无法访问 → 改用清华源
 #  - v2: 后端镜像装 LibreOffice 慢，SSH 容易 idle 中断 → build 改后台 nohup
 #  - v2: 容器启动慢，hub.docker.com 直拉超时 → 加 docker 镜像加速
-#  - v2: 凭据只打印易丢失 → 同步落盘到 /root/translation-credentials.txt
-#  - v3: UFW 与 Docker iptables 冲突导致 ERR_CONNECTION_REFUSED → 不装 UFW
-#  - v3: fail2ban 封禁 SSH 导致无法连接 → 不装 fail2ban
+#  - v4: 不修改主机防火墙/fail2ban，由运维按现网安全策略管理
+#  - v4: 所有随机凭据仅写入 chmod 600 的 deploy/.env，不打印、不另存副本
 #  - v3: SSH idle 超时断开 → 手动配置 KexAlgorithms + ClientAliveInterval
 #  - v3: PaddleOCR 推理 CPU 爆满 → 通过 num_threads=4 限制 OCR 线程数
 # ====================================================================
@@ -20,7 +19,6 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DEPLOY_DIR="$PROJECT_DIR/deploy"
-CRED_FILE="/root/translation-credentials.txt"
 BUILD_LOG="/var/log/translation-build.log"
 
 # 必须 root 跑
@@ -51,9 +49,7 @@ fi
 apt-get update -y
 apt-get -y install ca-certificates curl gnupg lsb-release \
                    git vim htop tar unzip openssl jq
-# 注意：不安装 ufw 和 fail2ban
-# - ufw 与 Docker 的 iptables 规则冲突，会导致 ERR_CONNECTION_REFUSED
-# - fail2ban 会封禁正常 SSH 连接，导致无法登录
+# 防火墙和 fail2ban 属于宿主机安全策略，本脚本既不安装也不卸载。
 
 timedatectl set-timezone Asia/Shanghai || true
 
@@ -119,16 +115,8 @@ else
 fi
 docker info 2>/dev/null | grep -A 4 "Registry Mirrors" || true
 
-echo "==[4/7] 清理防火墙 ======================================="
-# 卸载可能存在的 fail2ban（避免封禁 SSH）
-systemctl stop fail2ban 2>/dev/null || true
-systemctl disable fail2ban 2>/dev/null || true
-apt-get -y remove --purge fail2ban 2>/dev/null || true
-# iptables 全放通（内网测试服务器不需要防火墙）
-iptables -P INPUT ACCEPT 2>/dev/null || true
-iptables -P FORWARD ACCEPT 2>/dev/null || true
-iptables -P OUTPUT ACCEPT 2>/dev/null || true
-echo "  -> 防火墙已放通，fail2ban 已移除"
+echo "==[4/7] 检查主机安全策略 ================================="
+echo "  -> 不修改 UFW、iptables 或 fail2ban；请确保仅对外开放前端端口 8080"
 
 echo "==[5/7] 准备 .env =========================================="
 cd "$DEPLOY_DIR"
@@ -136,33 +124,25 @@ if [ ! -f .env ]; then
   cp .env.example .env
   SECRET_KEY=$(openssl rand -hex 32)
   ADMIN_TOKEN=$(openssl rand -hex 24)
+  DATA_ENCRYPTION_KEY=$(openssl rand -base64 32 | tr '+/' '-_')
   PG_PWD=$(openssl rand -hex 12)
+  REDIS_PWD=$(openssl rand -hex 24)
   MINIO_AK=$(openssl rand -hex 8)
   MINIO_SK=$(openssl rand -hex 16)
 
   sed -i "s|^APP_ENV=.*|APP_ENV=staging|" .env
   sed -i "s|^APP_SECRET_KEY=.*|APP_SECRET_KEY=${SECRET_KEY}|" .env
   sed -i "s|^APP_ADMIN_TOKEN=.*|APP_ADMIN_TOKEN=${ADMIN_TOKEN}|" .env
+  sed -i "s|^APP_DATA_ENCRYPTION_KEY=.*|APP_DATA_ENCRYPTION_KEY=${DATA_ENCRYPTION_KEY}|" .env
   sed -i "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=${PG_PWD}|" .env
+  sed -i "s|^REDIS_PASSWORD=.*|REDIS_PASSWORD=${REDIS_PWD}|" .env
   sed -i "s|^MINIO_ACCESS_KEY=.*|MINIO_ACCESS_KEY=${MINIO_AK}|" .env
   sed -i "s|^MINIO_SECRET_KEY=.*|MINIO_SECRET_KEY=${MINIO_SK}|" .env
   # AI 模型先占位，后续手动改
   sed -i "s|^DASHSCOPE_API_KEY=.*|DASHSCOPE_API_KEY=sk-placeholder-change-me|" .env
 
-  # 凭据落盘（避免被 SSH 输出截断丢失）
-  cat > "$CRED_FILE" <<EOC
-======== 翻译系统凭据 (生成于 $(date +%F\ %T)) ========
-管理员 Token (登录用) : ${ADMIN_TOKEN}
-Postgres 密码         : ${PG_PWD}
-MinIO Access Key      : ${MINIO_AK}
-MinIO Secret Key      : ${MINIO_SK}
-APP_SECRET_KEY        : ${SECRET_KEY}
-.env 路径             : ${DEPLOY_DIR}/.env
-====================================================
-EOC
-  chmod 600 "$CRED_FILE"
-  echo "  -> 已生成 .env，凭据保存在 ${CRED_FILE}（仅 root 可读）"
-  echo "     管理员 Token: ${ADMIN_TOKEN}"
+  chmod 600 .env
+  echo "  -> 已生成随机凭据并写入 ${DEPLOY_DIR}/.env（权限 600，未打印明文）"
 else
   echo "  -> 已存在 .env，跳过覆盖"
 fi
@@ -215,11 +195,11 @@ echo
 echo "==========================================================="
 echo "✅ 部署脚本执行完成"
 echo "  前端:         http://${IP}:8080"
-echo "  后端 Swagger: http://${IP}:8000/docs"
-echo "  MinIO 控制台: http://${IP}:9001"
+echo "  后端 Swagger: http://127.0.0.1:8000/docs（仅服务器本机/SSH 隧道）"
+echo "  MinIO 控制台: http://127.0.0.1:9001（仅服务器本机/SSH 隧道）"
 echo
-echo "  登录方式：用户名 admin + 凭据文件中的 APP_ADMIN_TOKEN"
-echo "  凭据文件：${CRED_FILE}"
+echo "  本地账号登录：使用数据库中保留/创建的本地用户名与密码"
+echo "  紧急 Bearer 管理 Token：${DEPLOY_DIR}/.env 中的 APP_ADMIN_TOKEN（不是登录密码）"
 echo "  构建日志：${BUILD_LOG}"
 echo
 echo "  AI 模型机接入后，编辑 ${DEPLOY_DIR}/.env 修改 DASHSCOPE_*"

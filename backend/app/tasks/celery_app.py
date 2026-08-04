@@ -7,16 +7,20 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
+import uuid
+from datetime import timedelta
 
 from celery import Celery
 from celery.schedules import crontab
-from sqlalchemy import text, update
+from sqlalchemy import or_, select, update
 
 from app.core.config import get_settings
 from app.core.database import SessionLocal
 from app.core.storage import download_bytes, upload_bytes
+from app.models.base import utc_now
 from app.models.task import TaskStatus, TranslationTask
 from app.services.document_engine import TranslationContext, translate_file
 from app.services.glossary import get_glossary_for_lang_pair
@@ -27,6 +31,9 @@ from app.services.translator import get_translator
 logger = logging.getLogger(__name__)
 
 _settings = get_settings()
+_redis_process_client = None
+_redis_process_pid: int | None = None
+_redis_init_lock = threading.Lock()
 
 celery_app = Celery(
     "translation",
@@ -40,6 +47,8 @@ celery_app.conf.update(
     timezone="Asia/Shanghai",
     enable_utc=False,
     task_track_started=True,
+    task_acks_late=True,
+    task_reject_on_worker_lost=True,
     worker_prefetch_multiplier=1,  # 严格 FIFO，不预取
     beat_schedule={
         # 每天 03:00 清理过期文件
@@ -77,67 +86,147 @@ def sync_oa_users_task() -> dict:
 
 @celery_app.task(name="translation.reconcile_stuck_tasks")
 def reconcile_stuck_tasks_task() -> dict:
-    """对账孤儿任务：RUNNING 但已无活跃 worker（并发槽位过期/缺失）的任务标记为 FAILED。
-
-    判定：任务处于 RUNNING，但其并发槽位（ZSET translation:running）缺失或心跳超过 TTL。
-    正在跑的任务每 ~2s 刷新槽位心跳，槽位 600s TTL 自愈；worker 被杀后心跳停止、
-    槽位过期消失，但 DB 状态仍停在 RUNNING —— 这类孤儿任务在此自动标记失败，
-    用户可点重试。同时清理可能泄漏的槽位。
-    """
-    from sqlalchemy import select, update
-
+    """恢复孤儿 RUNNING/QUEUED，并清理中断的 UPLOADING 任务。"""
     db = SessionLocal()
-    reconciled = 0
+    now = utc_now()
+    running_cutoff = now - timedelta(seconds=_ORPHAN_TIMEOUT_SECONDS)
+    queued_cutoff = now - timedelta(seconds=_QUEUED_RECONCILE_SECONDS)
+    uploading_cutoff = now - timedelta(seconds=_UPLOADING_TIMEOUT_SECONDS)
+    requeue_ids: list[str] = []
+    stale_slots: list[tuple[str, str | None]] = []
+    uploading_objects: list[str] = []
+    checked_running = checked_queued = checked_uploading = 0
     try:
         running = list(db.scalars(
             select(TranslationTask).where(TranslationTask.status == TaskStatus.RUNNING)
         ))
-        if not running:
-            return {"checked": 0, "reconciled": 0}
-        r = _redis_client()
-        now = time.time()
-        stale_cutoff = now - _SLOT_TTL_SECONDS - 120  # TTL + 2 分钟缓冲
+        checked_running = len(running)
         for task in running:
-            score = r.zscore(_CONCURRENCY_ZSET, task.id)
-            # 槽位缺失(None) 或 心跳过期 → worker 已死，孤儿任务
-            if score is None or score < stale_cutoff:
-                # 竞态防护：仅当任务此刻仍为 RUNNING 才标 FAILED。
-                # 从上面查询 running 列表到这里执行 update 之间存在时间窗口，
-                # 用户可能恰好重试了该孤儿任务（RUNNING→QUEUED），或 worker 抢占
-                # 置为其它状态；若无此条件会把 QUEUED 误覆盖成 FAILED，误杀重试。
+            if task.heartbeat_at is None or task.heartbeat_at < running_cutoff:
                 result = db.execute(
                     update(TranslationTask)
                     .where(
                         TranslationTask.id == task.id,
                         TranslationTask.status == TaskStatus.RUNNING,
+                        TranslationTask.attempt_id == task.attempt_id,
+                        or_(
+                            TranslationTask.heartbeat_at.is_(None),
+                            TranslationTask.heartbeat_at < running_cutoff,
+                        ),
                     )
                     .values(
-                        status=TaskStatus.FAILED,
-                        error_message="任务运行中断（服务器重启或 worker 异常退出），请点重试重新翻译。",
+                        status=TaskStatus.QUEUED,
+                        progress=0,
+                        error_message=None,
+                        attempt_id=None,
+                        heartbeat_at=None,
+                        updated_at=now,
                     )
                 )
                 if result.rowcount != 1:
-                    # 状态已在窗口内变化，跳过（不清槽位——留给新状态的属主管理）
-                    logger.info("对账：任务 %s 状态已变化，跳过标记", task.id)
+                    logger.info("对账：任务 %s 的状态或心跳已变化，跳过标记", task.id)
                     continue
-                # 清理可能残留的槽位
-                _release_concurrency_slot(task.id)
-                reconciled += 1
-                logger.warning("对账：孤儿任务 %s 标记为 FAILED（槽位 score=%s）", task.id, score)
-        if reconciled:
-            db.commit()
+                stale_slots.append((task.id, task.attempt_id))
+                requeue_ids.append(task.id)
+                logger.warning(
+                    "对账：孤儿任务 %s（attempt=%s）已恢复为 QUEUED",
+                    task.id,
+                    task.attempt_id,
+                )
+
+        stale_queued = list(db.scalars(
+            select(TranslationTask).where(
+                TranslationTask.status == TaskStatus.QUEUED,
+                TranslationTask.updated_at < queued_cutoff,
+            )
+        ))
+        checked_queued = len(stale_queued)
+        for task in stale_queued:
+            refreshed = db.execute(
+                update(TranslationTask)
+                .where(
+                    TranslationTask.id == task.id,
+                    TranslationTask.status == TaskStatus.QUEUED,
+                    TranslationTask.updated_at < queued_cutoff,
+                )
+                .values(updated_at=now)
+            )
+            if refreshed.rowcount == 1 and task.id not in requeue_ids:
+                requeue_ids.append(task.id)
+
+        stale_uploading = list(db.scalars(
+            select(TranslationTask).where(
+                TranslationTask.status == TaskStatus.UPLOADING,
+                TranslationTask.updated_at < uploading_cutoff,
+            )
+        ))
+        checked_uploading = len(stale_uploading)
+        for task in stale_uploading:
+            failed = db.execute(
+                update(TranslationTask)
+                .where(
+                    TranslationTask.id == task.id,
+                    TranslationTask.status == TaskStatus.UPLOADING,
+                    TranslationTask.updated_at < uploading_cutoff,
+                )
+                .values(
+                    status=TaskStatus.FAILED,
+                    error_message="上传中断或超时，请重新上传文件。",
+                    updated_at=now,
+                )
+            )
+            if failed.rowcount == 1 and task.source_object:
+                uploading_objects.append(task.source_object)
+
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
-    logger.info("对账完成：检查 %d 个 RUNNING，标记 %d 个孤儿为 FAILED", len(running), reconciled)
-    return {"checked": len(running), "reconciled": reconciled}
+
+    for task_id, attempt_id in stale_slots:
+        _release_concurrency_slot(task_id, attempt_id)
+
+    if uploading_objects:
+        from app.core.storage import secure_remove_object
+
+        for object_name in uploading_objects:
+            try:
+                secure_remove_object(object_name)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("清理超时上传对象 %s 失败：%s", object_name, exc)
+
+    enqueued = 0
+    enqueue_failed = 0
+    for task_id in requeue_ids:
+        try:
+            celery_app.send_task("translation.run", args=[task_id])
+            enqueued += 1
+        except Exception as exc:  # noqa: BLE001
+            # 保持 QUEUED，下一轮对账会继续尝试；broker 故障时不把可恢复任务误置失败。
+            enqueue_failed += 1
+            logger.error("对账：任务 %s 重新入队失败，将在下轮重试：%s", task_id, exc)
+
+    result = {
+        "running_checked": checked_running,
+        "running_recovered": len(stale_slots),
+        "queued_checked": checked_queued,
+        "uploading_checked": checked_uploading,
+        "uploading_failed": len(uploading_objects),
+        "enqueued": enqueued,
+        "enqueue_failed": enqueue_failed,
+    }
+    logger.info("任务对账完成：%s", result)
+    return result
 
 
 class TaskCancelled(Exception):
     """任务已被用户删除/取消，抛出该异常使 Worker 立即退出当前任务。"""
 
 
-def _check_task_alive(task_id: str) -> None:
-    """查询数据库，若任务已 DELETED 则抛 TaskCancelled。
+def _check_task_alive(task_id: str, attempt_id: str | None = None) -> None:
+    """确认任务未删除；提供 attempt_id 时还要确认当前 worker 仍拥有该尝试。
 
     用独立 Session 避免与主事务冲突；只读查询，无副作用。
     """
@@ -146,6 +235,10 @@ def _check_task_alive(task_id: str) -> None:
         t = s.get(TranslationTask, task_id)
         if t is None or t.status == TaskStatus.DELETED:
             raise TaskCancelled(f"任务 {task_id} 已被删除/取消")
+        if attempt_id is not None and (
+            t.status != TaskStatus.RUNNING or t.attempt_id != attempt_id
+        ):
+            raise TaskCancelled(f"任务 {task_id} 的执行权已转移")
     finally:
         s.close()
 
@@ -166,6 +259,10 @@ _CONCURRENCY_ZSET = "translation:running"
 # 槽位心跳过期秒数：超过此时长无心跳即视为死任务被回收。
 # 需大于"任务获得槽位 → 第一次进度回调"的最坏耗时（大扫描件 OCR 较慢），留足余量。
 _SLOT_TTL_SECONDS = 600
+_HEARTBEAT_INTERVAL_SECONDS = 30.0
+_ORPHAN_TIMEOUT_SECONDS = 120
+_QUEUED_RECONCILE_SECONDS = 15 * 60
+_UPLOADING_TIMEOUT_SECONDS = 15 * 60
 
 # 原子获取脚本：清理僵尸 → 已在册则续期放行 → 在册数未满则登记放行 → 否则拒绝
 _ACQUIRE_LUA = """
@@ -188,8 +285,30 @@ return 0
 
 
 def _redis_client():
+    """返回当前 worker/beat 进程复用的 Redis 客户端与连接池。"""
+    global _redis_process_client, _redis_process_pid
     import redis
-    return redis.from_url(_settings.redis_url, decode_responses=True)
+
+    process_id = os.getpid()
+    if _redis_process_client is None or _redis_process_pid != process_id:
+        with _redis_init_lock:
+            if _redis_process_client is None or _redis_process_pid != process_id:
+                old_client = _redis_process_client
+                _redis_process_client = redis.from_url(
+                    _settings.redis_url,
+                    decode_responses=True,
+                )
+                _redis_process_pid = process_id
+                if old_client is not None:
+                    try:
+                        old_client.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+    return _redis_process_client
+
+
+def _slot_member(task_id: str, attempt_id: str | None) -> str:
+    return f"{task_id}:{attempt_id}" if attempt_id else task_id
 
 
 def _get_max_concurrency() -> int:
@@ -210,50 +329,92 @@ def _get_max_concurrency() -> int:
     return max(1, _settings.translation_max_concurrency)
 
 
-def _acquire_concurrency_slot(task_id: str, poll_interval: float = 2.0) -> None:
+def _acquire_concurrency_slot(
+    task_id: str, attempt_id: str, poll_interval: float = 2.0
+) -> None:
     """获取翻译许可，超出上限时阻塞等待。
 
     用 Redis ZSET + Lua 原子判断：清理 TTL 过期的僵尸条目后，在册数未满才放行。
     等待期间定期检查任务是否已被删除，避免对已删任务继续占用 worker。
     """
-    try:
-        r = _redis_client()
-        acquire = r.register_script(_ACQUIRE_LUA)
-        while True:
-            # 任务在排队期间可能已被删除
-            _check_task_alive(task_id)
-
+    member = _slot_member(task_id, attempt_id)
+    while True:
+        # 任务在排队期间可能已被删除
+        _check_task_alive(task_id)
+        try:
+            r = _redis_client()
+            acquire = r.register_script(_ACQUIRE_LUA)
             max_c = _get_max_concurrency()
             ok = acquire(
                 keys=[_CONCURRENCY_ZSET],
-                args=[time.time(), _SLOT_TTL_SECONDS, max_c, task_id],
+                args=[time.time(), _SLOT_TTL_SECONDS, max_c, member],
             )
             if ok == 1:
                 logger.info("任务 %s 获得并发槽位（上限 %d）", task_id, max_c)
                 return
             logger.info("任务 %s 等待并发槽位（上限 %d）", task_id, max_c)
-            time.sleep(poll_interval)
-    except TaskCancelled:
-        raise
-    except Exception as exc:
-        logger.warning("并发闸门异常，降级为直接放行：%s", exc)
-        return
+        except Exception as exc:  # noqa: BLE001
+            # fail-closed：Redis 不可用时绝不能绕过全局并发上限。
+            logger.error("并发闸门不可用，任务 %s 保持等待：%s", task_id, exc)
+        time.sleep(poll_interval)
 
 
-def _heartbeat_concurrency_slot(task_id: str) -> None:
+def _heartbeat_concurrency_slot(task_id: str, attempt_id: str) -> None:
     """刷新槽位心跳（任务执行中周期调用），避免长任务被 TTL 误回收。"""
     try:
-        _redis_client().zadd(_CONCURRENCY_ZSET, {task_id: time.time()})
-    except Exception:
-        pass
+        _redis_client().zadd(
+            _CONCURRENCY_ZSET,
+            {_slot_member(task_id, attempt_id): time.time()},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("任务 %s 刷新 Redis 并发心跳失败：%s", task_id, exc)
 
 
-def _release_concurrency_slot(task_id: str) -> None:
+def _release_concurrency_slot(task_id: str, attempt_id: str | None) -> None:
     """释放翻译许可。"""
     try:
-        _redis_client().zrem(_CONCURRENCY_ZSET, task_id)
+        _redis_client().zrem(_CONCURRENCY_ZSET, _slot_member(task_id, attempt_id))
     except Exception as exc:
         logger.warning("释放并发槽位失败：%s", exc)
+
+
+def _heartbeat_attempt(task_id: str, attempt_id: str) -> bool:
+    """刷新 Redis 与数据库心跳；返回该 attempt 是否仍拥有任务。"""
+    _heartbeat_concurrency_slot(task_id, attempt_id)
+    heartbeat_db = SessionLocal()
+    try:
+        result = heartbeat_db.execute(
+            update(TranslationTask)
+            .where(
+                TranslationTask.id == task_id,
+                TranslationTask.status == TaskStatus.RUNNING,
+                TranslationTask.attempt_id == attempt_id,
+            )
+            .values(heartbeat_at=utc_now())
+        )
+        heartbeat_db.commit()
+        return result.rowcount == 1
+    except Exception as exc:  # noqa: BLE001
+        heartbeat_db.rollback()
+        logger.warning("任务 %s 刷新数据库心跳失败：%s", task_id, exc)
+        # 数据库暂时不可用不能证明执行权已转移；恢复后条件更新仍会校验 attempt。
+        return True
+    finally:
+        heartbeat_db.close()
+
+
+def _heartbeat_loop(
+    task_id: str,
+    attempt_id: str,
+    stop_event: threading.Event,
+    ownership_lost: threading.Event,
+) -> None:
+    """独立于文档进度运行，覆盖下载、OCR、术语抽取、翻译与上传阶段。"""
+    while not stop_event.is_set():
+        if not _heartbeat_attempt(task_id, attempt_id):
+            ownership_lost.set()
+            return
+        stop_event.wait(_HEARTBEAT_INTERVAL_SECONDS)
 
 
 def _humanize_error(exc: Exception) -> str:
@@ -279,10 +440,21 @@ def _humanize_error(exc: Exception) -> str:
     return f"翻译失败：{msg}"
 
 
-@celery_app.task(name="translation.run", bind=True, max_retries=0)
+@celery_app.task(
+    name="translation.run",
+    bind=True,
+    max_retries=0,
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
 def run_translation_task(self, task_id: str) -> None:  # noqa: ARG001
     db = SessionLocal()
+    attempt_id = str(uuid.uuid4())
     slot_acquired = False
+    attempt_claimed = False
+    heartbeat_stop = threading.Event()
+    ownership_lost = threading.Event()
+    heartbeat_thread: threading.Thread | None = None
     try:
         task = db.get(TranslationTask, task_id)
         if task is None:
@@ -293,7 +465,7 @@ def run_translation_task(self, task_id: str) -> None:  # noqa: ARG001
 
         # 应用层并发闸门：等待获取全局翻译许可
         # 在标记 RUNNING 之前等待，让用户看到的是"排队中"而非假进度
-        _acquire_concurrency_slot(task_id)
+        _acquire_concurrency_slot(task_id, attempt_id)
         slot_acquired = True
 
         # 条件更新"抢占"任务：仅 QUEUED 状态可转 RUNNING。
@@ -306,13 +478,27 @@ def run_translation_task(self, task_id: str) -> None:  # noqa: ARG001
                 TranslationTask.id == task_id,
                 TranslationTask.status == TaskStatus.QUEUED,
             )
-            .values(status=TaskStatus.RUNNING, progress=10)
+            .values(
+                status=TaskStatus.RUNNING,
+                progress=10,
+                attempt_id=attempt_id,
+                heartbeat_at=utc_now(),
+            )
         )
         db.commit()
         if claimed.rowcount != 1:
             logger.info("任务 %s 状态已非 QUEUED（已删除或已被其它 worker 抢占），跳过", task_id)
             return
+        attempt_claimed = True
         db.refresh(task)
+
+        heartbeat_thread = threading.Thread(
+            target=_heartbeat_loop,
+            args=(task_id, attempt_id, heartbeat_stop, ownership_lost),
+            name=f"translation-heartbeat-{task_id}",
+            daemon=True,
+        )
+        heartbeat_thread.start()
 
         source_bytes = download_bytes(task.source_object)
 
@@ -320,41 +506,40 @@ def run_translation_task(self, task_id: str) -> None:  # noqa: ARG001
         # 注意：on_progress 会被多个翻译线程并发调用，SQLAlchemy Session 非线程安全，
         # 必须用锁串行化 DB 操作。
         last_written = {"v": 10}
-        last_alive_check = {"t": 0.0}
         progress_lock = threading.Lock()
 
         def on_progress(done: int, total: int) -> None:
-            # 存活检查 + 槽位心跳：节流到最多每 2s 一次。
-            # 否则每完成一段都查一次库，高并发下会打满连接池。
-            now = time.time()
-            do_check = False
-            with progress_lock:
-                if now - last_alive_check["t"] >= 2.0:
-                    last_alive_check["t"] = now
-                    do_check = True
-            if do_check:
-                # 已删除则抛 TaskCancelled，让翻译循环立即退出
-                _check_task_alive(task_id)
-                # 刷新并发槽位心跳，避免长任务被 TTL 误回收
-                _heartbeat_concurrency_slot(task_id)
+            if ownership_lost.is_set():
+                raise TaskCancelled(f"任务 {task_id} 的执行权已转移")
             pct = 10 + int((done / max(total, 1)) * 80)
             pct = max(10, min(90, pct))
             with progress_lock:
                 if pct - last_written["v"] < 1:
                     return
                 last_written["v"] = pct
-                task.progress = pct  # 更新主 Session 对象属性（不 commit）
             # 用独立 Session 写 DB，避免多线程共享主 Session 的 commit 问题
             # SQLAlchemy Session 非线程安全，多线程并发 commit 会导致状态不一致
             progress_db = SessionLocal()
             try:
-                progress_db.execute(
-                    text("UPDATE translation_tasks SET progress = :p WHERE id = :id"),
-                    {"p": pct, "id": task_id}
+                result = progress_db.execute(
+                    update(TranslationTask)
+                    .where(
+                        TranslationTask.id == task_id,
+                        TranslationTask.status == TaskStatus.RUNNING,
+                        TranslationTask.attempt_id == attempt_id,
+                    )
+                    .values(progress=pct)
                 )
                 progress_db.commit()
-            except Exception:
+                if result.rowcount != 1:
+                    ownership_lost.set()
+                    raise TaskCancelled(f"任务 {task_id} 的执行权已转移")
+            except TaskCancelled:
                 progress_db.rollback()
+                raise
+            except Exception as exc:  # noqa: BLE001
+                progress_db.rollback()
+                logger.warning("任务 %s 写入进度失败：%s", task_id, exc)
             finally:
                 progress_db.close()
 
@@ -403,11 +588,21 @@ def run_translation_task(self, task_id: str) -> None:  # noqa: ARG001
             pdf_output_format=task.pdf_output_format.value,
         )
 
-        task.progress = 90
+        progressed = db.execute(
+            update(TranslationTask)
+            .where(
+                TranslationTask.id == task_id,
+                TranslationTask.status == TaskStatus.RUNNING,
+                TranslationTask.attempt_id == attempt_id,
+            )
+            .values(progress=90)
+        )
         db.commit()
+        if progressed.rowcount != 1:
+            raise TaskCancelled(f"任务 {task_id} 的执行权已转移")
 
         # 上传译文前最后确认一次任务未被删除，缩小竞态窗口
-        _check_task_alive(task_id)
+        _check_task_alive(task_id, attempt_id)
 
         result_object = f"results/{task.id}.{out_ext}"
         upload_bytes(result_object, result_bytes)
@@ -421,11 +616,13 @@ def run_translation_task(self, task_id: str) -> None:  # noqa: ARG001
             .where(
                 TranslationTask.id == task_id,
                 TranslationTask.status == TaskStatus.RUNNING,
+                TranslationTask.attempt_id == attempt_id,
             )
             .values(
                 result_object=result_object,
                 status=TaskStatus.SUCCEEDED,
                 progress=100,
+                heartbeat_at=utc_now(),
             )
         )
         db.commit()
@@ -446,20 +643,25 @@ def run_translation_task(self, task_id: str) -> None:  # noqa: ARG001
         return
     except Exception as exc:  # noqa: BLE001
         db.rollback()
-        # 条件更新：仅 QUEUED/RUNNING 可转 FAILED——已删除的任务保持 DELETED，
-        # 已被其它流程收尾的任务也不会被覆写（检查+赋值的旧写法存在竞态）。
+        # attempt 已抢占时只允许它结束自己的 RUNNING；抢占前则只处理仍为 QUEUED
+        # 且没有属主的任务。删除、重试和新 attempt 都不会被旧 worker 覆盖。
         try:
-            db.execute(
-                update(TranslationTask)
-                .where(
-                    TranslationTask.id == task_id,
-                    TranslationTask.status.in_(
-                        [TaskStatus.QUEUED, TaskStatus.RUNNING]
-                    ),
+            failure = update(TranslationTask).where(TranslationTask.id == task_id)
+            if attempt_claimed:
+                failure = failure.where(
+                    TranslationTask.status == TaskStatus.RUNNING,
+                    TranslationTask.attempt_id == attempt_id,
                 )
-                .values(
+            else:
+                failure = failure.where(
+                    TranslationTask.status == TaskStatus.QUEUED,
+                    TranslationTask.attempt_id.is_(None),
+                )
+            db.execute(
+                failure.values(
                     status=TaskStatus.FAILED,
                     error_message=_humanize_error(exc)[:1000],
+                    heartbeat_at=utc_now() if attempt_claimed else None,
                 )
             )
             db.commit()
@@ -468,6 +670,9 @@ def run_translation_task(self, task_id: str) -> None:  # noqa: ARG001
         # 不再 raise：max_retries=0 已禁用重试，且抛异常会导致日志混乱
         return
     finally:
+        heartbeat_stop.set()
+        if heartbeat_thread is not None:
+            heartbeat_thread.join(timeout=_HEARTBEAT_INTERVAL_SECONDS + 1)
         if slot_acquired:
-            _release_concurrency_slot(task_id)
+            _release_concurrency_slot(task_id, attempt_id)
         db.close()

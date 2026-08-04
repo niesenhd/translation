@@ -8,10 +8,12 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
 from app.core.config import get_settings
+from app.core.crypto import encrypt_secret
 from app.core.database import SessionLocal
 from app.core.security import CurrentUser, require_admin
 from app.models.system_config import SystemConfig
 from app.models.task import TaskStatus, TranslationTask
+from app.models.user import User
 from app.services.retention import (
     cleanup_expired_files,
     get_retention_days,
@@ -96,7 +98,7 @@ def get_stats():
 
         # 用户数
         total_users = db.scalar(
-            select(func.count(func.distinct(TranslationTask.owner)))
+            select(func.count()).select_from(User)
         ) or 0
 
         # 文件类型分布
@@ -214,7 +216,7 @@ def update_model_config(payload: ModelConfigUpdate, user: CurrentUser = Depends(
     if payload.api_base_url is not None:
         _set_config_value(KEY_API_BASE_URL, payload.api_base_url, user.username)
     if payload.api_key is not None:
-        _set_config_value(KEY_API_KEY, payload.api_key, user.username)
+        _set_config_value(KEY_API_KEY, encrypt_secret(payload.api_key), user.username)
 
     # 重置翻译器单例，使新配置生效
     from app.services.translator import reset_translator

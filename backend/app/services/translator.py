@@ -14,6 +14,7 @@ from openai import APIError, APITimeoutError, BadRequestError, RateLimitError
 import time
 
 from app.core.config import get_settings
+from app.core.languages import LANGUAGE_NAMES, resolve_language_name
 
 logger = logging.getLogger(__name__)
 
@@ -80,37 +81,6 @@ class ContentRejectedError(RuntimeError):
     常见原因：prompt 过长、内容触发安全过滤策略。
     上层应保留原文兜底，不阻塞整体翻译任务。
     """
-
-
-# 语言代码（前端发送的 BCP-47 / 自定义代码） → Prompt 中使用的明确语言名
-# 关键约束：
-# 1. 必须用英文语言名，模型识别度最高、最稳定
-# 2. 中文必须区分简体（Simplified）和繁体（Traditional），否则模型可能默认输出简体
-LANGUAGE_NAMES: dict[str, str] = {
-    "zh": "Simplified Chinese",
-    "zh-Hans": "Simplified Chinese",
-    "zh-CN": "Simplified Chinese",
-    "zh-Hant": "Traditional Chinese",
-    "zh-TW": "Traditional Chinese",
-    "zh-HK": "Traditional Chinese (Hong Kong)",
-    "en": "English",
-    "fr": "French",
-    "es": "Spanish",
-    "ru": "Russian",
-    "ar": "Arabic",
-    "ja": "Japanese",
-    "ko": "Korean",
-    "de": "German",
-    "pt": "Portuguese",
-    "it": "Italian",
-}
-
-
-def resolve_language_name(code: str) -> str:
-    """把语言代码解析为模型友好的语言名。未知代码原样返回。"""
-    if not code:
-        return "English"
-    return LANGUAGE_NAMES.get(code, LANGUAGE_NAMES.get(code.split("-")[0], code))
 
 
 # ── 术语匹配 ────────────────────────────────────────────────────────
@@ -224,20 +194,13 @@ class DashScopeTranslator(Translator):
     def __init__(self) -> None:
         settings = get_settings()
 
-        # 1. 优先从 model_configs 表读取激活配置
-        from app.api.model_configs import get_active_translation_config
-        active = get_active_translation_config()
+        from app.models.model_config import ModelType
+        from app.services.model_config_service import get_runtime_model_config
 
-        if active:
-            api_key = active.api_key
-            base_url = active.api_base_url
-            model = active.model_id
-        else:
-            # 2. 其次从 system_config 读取
-            from app.api.admin import _get_config_value, KEY_TRANSLATION_MODEL, KEY_API_BASE_URL, KEY_API_KEY
-            api_key = _get_config_value(KEY_API_KEY, settings.dashscope_api_key)
-            base_url = _get_config_value(KEY_API_BASE_URL, settings.dashscope_base_url)
-            model = _get_config_value(KEY_TRANSLATION_MODEL, settings.dashscope_model)
+        active = get_runtime_model_config(ModelType.TRANSLATION, settings)
+        api_key = active.api_key
+        base_url = active.api_base_url
+        model = active.model_id
 
         if not api_key:
             raise RuntimeError("未配置翻译模型 API Key")

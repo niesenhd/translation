@@ -1,9 +1,9 @@
-"""鉴权：本地账密登录（OA 律智荟对接前的过渡方案）+ 静态 admin Token 兜底。
+"""鉴权：本地账号/OA SSO 会话 + 静态 admin Token 兜底。
 
 - 用户名/密码登录：POST /api/auth/login 校验密码后签发 HMAC 签名 token（无状态，
   载荷含 username + 过期时间，用 app_secret_key 签名）。
 - 兼容：原静态 admin token 仍可用作紧急超级管理员入口。
-- P3 阶段对接律智荟 OA 时，只需在 _authenticate_oa 补充实现即可。
+- OA 用户仅能通过 SSO 换取本站会话 token；离职状态会在每次鉴权时复查。
 """
 import base64
 import hashlib
@@ -37,7 +37,9 @@ def hash_password(password: str) -> str:
     return f"pbkdf2_sha256${_PBKDF2_ITER}${salt.hex()}${dk.hex()}"
 
 
-def verify_password(password: str, stored: str) -> bool:
+def verify_password(password: str, stored: str | None) -> bool:
+    if not stored:
+        return False
     try:
         algo, iter_s, salt_hex, hash_hex = stored.split("$")
         if algo != "pbkdf2_sha256":
@@ -95,17 +97,12 @@ def _authenticate_admin(token: str, settings: Settings) -> Optional[CurrentUser]
     return None
 
 
-def _authenticate_oa(access_token: str, settings: Settings) -> Optional[CurrentUser]:  # noqa: ARG001
-    """P3 阶段实现：调律智荟 getUserInfo 接口换取用户信息。当前未启用。"""
-    return None
-
-
 def _authenticate_session(token: str, settings: Settings) -> Optional[CurrentUser]:
-    """签名 token → 查 users 表 → CurrentUser（校验 is_active）。"""
+    """签名 token → 查 users 表，并实时校验账号及 OA 在职状态。"""
     username = _verify_token(token, settings)
     if not username:
         return None
-    from app.models.user import User
+    from app.models.user import AUTH_SOURCE_OA, User
     from app.core.database import SessionLocal
     from sqlalchemy import select as _sel
     db = SessionLocal()
@@ -115,6 +112,9 @@ def _authenticate_session(token: str, settings: Settings) -> Optional[CurrentUse
         db.close()
     if user is None or not user.is_active:
         return None
+    is_oa_account = user.auth_source == AUTH_SOURCE_OA or bool(user.oa_id)
+    if is_oa_account and not user.oa_employed:
+        return None
     return CurrentUser(username=user.username, is_admin=user.is_admin)
 
 
@@ -122,7 +122,7 @@ def get_current_user(
     authorization: str = Header(default=""),
     settings: Settings = Depends(get_settings),
 ) -> CurrentUser:
-    """从 Authorization 头解析当前用户（签名 token / 静态 admin token / OA）。"""
+    """从 Authorization 头解析当前用户（本站签名 token / 静态 admin token）。"""
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="缺少 Token")
 
@@ -130,7 +130,6 @@ def get_current_user(
     user = (
         _authenticate_session(token, settings)
         or _authenticate_admin(token, settings)
-        or _authenticate_oa(token, settings)
     )
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token 无效或已过期")

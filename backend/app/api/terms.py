@@ -2,17 +2,29 @@
 from __future__ import annotations
 
 import io
-import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
+from sqlalchemy.exc import IntegrityError
 
 from app.core.database import SessionLocal
 from app.core.security import CurrentUser, require_admin
 from app.models.term import TermEntry, TermPriority
+from app.services.terminology_repository import upsert_term as _upsert_term
 
 router = APIRouter(prefix="/admin/terms", tags=["terms"], dependencies=[Depends(require_admin)])
+
+_MAX_SDLTB_BYTES = 50 * 1024 * 1024
+_MAX_SDLTB_TABLES = 128
+_MAX_SDLTB_COLUMNS = 256
+_MAX_SDLTB_ROWS = 50_000
+_MAX_SDLTB_QUERY_STEPS = 10_000_000
+_MAX_SDLTB_IDENTIFIER_LENGTH = 256
+
+
+class _SDLTBLimitExceeded(ValueError):
+    pass
 
 
 # ── Schemas ──────────────────────────────────────────────────────────
@@ -127,19 +139,23 @@ def list_terms(
 def create_term(payload: TermCreate, user: CurrentUser = Depends(require_admin)):
     db = SessionLocal()
     try:
-        entry = TermEntry(
-            id=str(uuid.uuid4()),
+        _upsert_term(
+            db,
             source_term=payload.source_term,
             target_term=payload.target_term,
             lang_pair=payload.lang_pair,
             domain=payload.domain,
             priority=payload.priority,
             note=payload.note,
-            updated_by=user.username,
+            username=user.username,
         )
-        db.add(entry)
         db.commit()
-        db.refresh(entry)
+        entry = db.scalar(
+            select(TermEntry).where(
+                TermEntry.lang_pair == payload.lang_pair,
+                TermEntry.source_normalized == payload.source_term.strip().lower(),
+            )
+        )
         return TermRead(
             id=entry.id,
             source_term=entry.source_term,
@@ -165,7 +181,14 @@ def update_term(term_id: str, payload: TermUpdate, user: CurrentUser = Depends(r
         for field, value in payload.model_dump(exclude_unset=True).items():
             setattr(entry, field, value)
         entry.updated_by = user.username
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="同一语种方向下已存在相同的归一化源术语",
+            ) from exc
         db.refresh(entry)
         return TermRead(
             id=entry.id,
@@ -241,10 +264,16 @@ def import_terms(
     可选参数 domain：当传入时，作为本次导入的领域。文件中没有领域字段或为空时使用此值。
     """
     filename = (file.filename or "").lower()
-    content = file.file.read()
+    is_sdltb = filename.endswith(".sdltb")
+    declared_size = getattr(file, "size", None)
+    if is_sdltb and declared_size is not None and declared_size > _MAX_SDLTB_BYTES:
+        raise HTTPException(status_code=413, detail="SDLTB 文件过大，最大支持 50MB")
+    content = file.file.read(_MAX_SDLTB_BYTES + 1) if is_sdltb else file.file.read()
+    if is_sdltb and len(content) > _MAX_SDLTB_BYTES:
+        raise HTTPException(status_code=413, detail="SDLTB 文件过大，最大支持 50MB")
     default_domain = (domain or "").strip() or None
 
-    if filename.endswith(".sdltb"):
+    if is_sdltb:
         return _import_sdltb(content, user, default_domain=default_domain)
     elif filename.endswith(".csv"):
         import csv
@@ -303,30 +332,16 @@ def _import_rows(rows: list, user, default_domain: str | None = None) -> dict:
 
             priority = TermPriority.STRICT if priority_str == "strict" else TermPriority.PREFERRED
 
-            # 去重：同语种方向下中文术语重复则覆盖
-            existing = db.scalar(
-                select(TermEntry).where(
-                    TermEntry.source_term == source_term,
-                    TermEntry.lang_pair == lang_pair,
-                )
+            _upsert_term(
+                db,
+                source_term=source_term,
+                target_term=target_term,
+                lang_pair=lang_pair,
+                domain=domain,
+                priority=priority,
+                note=note,
+                username=user.username,
             )
-            if existing:
-                existing.target_term = target_term
-                existing.domain = domain
-                existing.priority = priority
-                existing.note = note
-                existing.updated_by = user.username
-            else:
-                db.add(TermEntry(
-                    id=str(uuid.uuid4()),
-                    source_term=source_term,
-                    target_term=target_term,
-                    lang_pair=lang_pair,
-                    domain=domain,
-                    priority=priority,
-                    note=note,
-                    updated_by=user.username,
-                ))
             imported += 1
         db.commit()
         return {"imported": imported, "skipped": skipped}
@@ -395,6 +410,8 @@ def _import_sdltb(content: bytes, user, default_domain: str | None = None) -> di
 
     except HTTPException:
         raise
+    except _SDLTBLimitExceeded as e:
+        raise HTTPException(status_code=400, detail=f"SDLTB 超出安全处理限额：{e}") from e
     except Exception as e:
         logger.error("SDLTB 解析失败: %s", e)
         raise HTTPException(status_code=400, detail=f"SDLTB 文件解析失败：{e}")
@@ -416,6 +433,9 @@ def _extract_sdltb_access(db, tables: dict) -> list[dict]:
     """
     import logging
     logger = logging.getLogger(__name__)
+
+    if len(tables) > _MAX_SDLTB_TABLES:
+        raise _SDLTBLimitExceeded(f"表数量超过 {_MAX_SDLTB_TABLES}")
 
     # 找出所有语言表（以 I_ 开头的表）
     lang_tables = {}
@@ -452,6 +472,7 @@ def _extract_sdltb_access(db, tables: dict) -> list[dict]:
     # conceptid -> {lang_code: term_text}
     concept_map: dict[str, dict[str, str]] = {}
 
+    total_rows = 0
     for lang_name, table_name in lang_tables.items():
         try:
             table_data = db.parse_table(table_name)
@@ -461,6 +482,10 @@ def _extract_sdltb_access(db, tables: dict) -> list[dict]:
 
             # 获取列名
             columns = list(table_data.keys())
+            if len(columns) > _MAX_SDLTB_COLUMNS:
+                raise _SDLTBLimitExceeded(
+                    f"表 {table_name!r} 的列数量超过 {_MAX_SDLTB_COLUMNS}"
+                )
             logger.info("表 %s 列: %s", table_name, columns)
 
             # 查找 conceptid 和 origterm 列
@@ -483,6 +508,9 @@ def _extract_sdltb_access(db, tables: dict) -> list[dict]:
 
             # 读取数据
             row_count = len(table_data[concept_col])
+            total_rows += row_count
+            if row_count > _MAX_SDLTB_ROWS or total_rows > _MAX_SDLTB_ROWS:
+                raise _SDLTBLimitExceeded(f"术语行数超过 {_MAX_SDLTB_ROWS}")
             logger.info("表 %s 共 %d 行数据, concept_col=%s, term_col=%s", table_name, row_count, concept_col, term_col)
 
             # 调试：打印前3行
@@ -507,6 +535,8 @@ def _extract_sdltb_access(db, tables: dict) -> list[dict]:
                     concept_map[concept_id] = {}
                 concept_map[concept_id][lang_code] = term_text
 
+        except _SDLTBLimitExceeded:
+            raise
         except Exception as exc:
             logger.warning("解析表 %s 失败: %s", table_name, exc)
             continue
@@ -542,6 +572,8 @@ def _extract_sdltb_access(db, tables: dict) -> list[dict]:
                     "target_term": target_text,
                     "lang_pair": f"zh→{target_lang}",
                 })
+                if len(entries) > _MAX_SDLTB_ROWS:
+                    raise _SDLTBLimitExceeded(f"配对术语数超过 {_MAX_SDLTB_ROWS}")
         else:
             # 没有中文，取排序最前的语言作为源
             sorted_langs = sorted(lang_terms.items())
@@ -552,9 +584,22 @@ def _extract_sdltb_access(db, tables: dict) -> list[dict]:
                     "target_term": target_text,
                     "lang_pair": f"{source_lang}→{target_lang}",
                 })
+                if len(entries) > _MAX_SDLTB_ROWS:
+                    raise _SDLTBLimitExceeded(f"配对术语数超过 {_MAX_SDLTB_ROWS}")
 
     logger.info("配对结果: %d 条术语, %d 个概念无配对", len(entries), no_pair_count)
     return entries
+
+
+def _quote_sqlite_identifier(value: str) -> str:
+    """把 SQLite schema 提供的标识符安全引用为单个 identifier。"""
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise ValueError("无效 SQLite 标识符")
+    if len(value) > _MAX_SDLTB_IDENTIFIER_LENGTH:
+        raise _SDLTBLimitExceeded(
+            f"标识符长度超过 {_MAX_SDLTB_IDENTIFIER_LENGTH}"
+        )
+    return '"' + value.replace('"', '""') + '"'
 
 
 def _import_sdltb_sqlite(content: bytes, user, default_domain: str | None = None) -> dict:
@@ -563,25 +608,45 @@ def _import_sdltb_sqlite(content: bytes, user, default_domain: str | None = None
     import tempfile
     import os
     import logging
+    from pathlib import Path
 
     logger = logging.getLogger(__name__)
 
     tmp_path = None
+    conn = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".sdltb", delete=False) as tmp:
             tmp.write(content)
             tmp_path = tmp.name
 
-        conn = sqlite3.connect(tmp_path)
+        # 只读 + immutable：即使后续查询代码回归，也不能修改上传数据库或创建 journal。
+        sqlite_uri = Path(tmp_path).as_uri() + "?mode=ro&immutable=1"
+        conn = sqlite3.connect(sqlite_uri, uri=True)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("PRAGMA trusted_schema=OFF")
+        if conn.execute("PRAGMA query_only").fetchone()[0] != 1:
+            raise RuntimeError("无法启用 SQLite query_only")
+
+        vm_steps = {"count": 0}
+
+        def _limit_query_steps() -> int:
+            vm_steps["count"] += 1_000
+            return int(vm_steps["count"] > _MAX_SDLTB_QUERY_STEPS)
+
+        conn.set_progress_handler(_limit_query_steps, 1_000)
         cursor = conn.cursor()
 
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' LIMIT ?",
+            (_MAX_SDLTB_TABLES + 1,),
+        )
         tables = [row["name"] for row in cursor.fetchall()]
+        if len(tables) > _MAX_SDLTB_TABLES:
+            raise _SDLTBLimitExceeded(f"表数量超过 {_MAX_SDLTB_TABLES}")
         logger.info("SDLTB (SQLite) 表: %s", tables)
 
         entries = _extract_sdltb_sqlite_entries(cursor, tables)
-        conn.close()
 
         if not entries:
             raise HTTPException(status_code=400, detail="SDLTB 文件中未找到术语数据，或表结构不被支持")
@@ -601,10 +666,14 @@ def _import_sdltb_sqlite(content: bytes, user, default_domain: str | None = None
 
     except HTTPException:
         raise
+    except _SDLTBLimitExceeded as e:
+        raise HTTPException(status_code=400, detail=f"SDLTB 超出安全处理限额：{e}") from e
     except Exception as e:
         logger.error("SDLTB (SQLite) 解析失败: %s", e)
         raise HTTPException(status_code=400, detail=f"SDLTB 文件解析失败：{e}")
     finally:
+        if conn is not None:
+            conn.close()
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
@@ -625,9 +694,13 @@ def _extract_sdltb_sqlite_entries(cursor, tables: list[str]) -> list[dict]:
                 JOIN mt_lang l ON t.lang_id = l.id
                 JOIN mt_concept e ON l.concept_id = e.id
                 ORDER BY e.entry_id, l.lang
-            """)
+                LIMIT ?
+            """, (_MAX_SDLTB_ROWS + 1,))
+            rows = cursor.fetchall()
+            if len(rows) > _MAX_SDLTB_ROWS:
+                raise _SDLTBLimitExceeded(f"术语行数超过 {_MAX_SDLTB_ROWS}")
             entry_map: dict[int, list[tuple[str, str]]] = {}
-            for row in cursor.fetchall():
+            for row in rows:
                 entry_id = row[0]
                 lang_code = row[1]
                 term_text = row[2]
@@ -637,6 +710,8 @@ def _extract_sdltb_sqlite_entries(cursor, tables: list[str]) -> list[dict]:
             entries = _pair_terms_by_entry(entry_map)
             if entries:
                 return entries
+        except _SDLTBLimitExceeded:
+            raise
         except Exception as exc:
             logger.debug("mt_* 表提取失败: %s", exc)
 
@@ -649,9 +724,13 @@ def _extract_sdltb_sqlite_entries(cursor, tables: list[str]) -> list[dict]:
                 JOIN tbx_lang l ON t.lang_id = l.id
                 JOIN tbx_entry e ON l.entry_id = e.id
                 ORDER BY e.id, l.lang
-            """)
+                LIMIT ?
+            """, (_MAX_SDLTB_ROWS + 1,))
+            rows = cursor.fetchall()
+            if len(rows) > _MAX_SDLTB_ROWS:
+                raise _SDLTBLimitExceeded(f"术语行数超过 {_MAX_SDLTB_ROWS}")
             entry_map: dict[int, list[tuple[str, str]]] = {}
-            for row in cursor.fetchall():
+            for row in rows:
                 entry_id = row[0]
                 lang_code = row[1]
                 term_text = row[2]
@@ -661,6 +740,8 @@ def _extract_sdltb_sqlite_entries(cursor, tables: list[str]) -> list[dict]:
             entries = _pair_terms_by_entry(entry_map)
             if entries:
                 return entries
+        except _SDLTBLimitExceeded:
+            raise
         except Exception as exc:
             logger.debug("tbx_* 表提取失败: %s", exc)
 
@@ -670,11 +751,16 @@ def _extract_sdltb_sqlite_entries(cursor, tables: list[str]) -> list[dict]:
         logger.info("发现 I_ 开头的表: %s", i_tables)
         # SQLite 中不太可能有 I_ 表，但以防万一
         entry_map: dict[str, list[tuple[str, str]]] = {}
+        total_rows = 0
         for table in i_tables:
             lang_code = table[2:].lower()
             try:
-                cursor.execute(f"PRAGMA table_info({table})")
+                cursor.execute(f"PRAGMA table_info({_quote_sqlite_identifier(table)})")
                 columns = [row[1] for row in cursor.fetchall()]
+                if len(columns) > _MAX_SDLTB_COLUMNS:
+                    raise _SDLTBLimitExceeded(
+                        f"表 {table!r} 的列数量超过 {_MAX_SDLTB_COLUMNS}"
+                    )
                 term_col = None
                 concept_col = None
                 for col in columns:
@@ -684,13 +770,25 @@ def _extract_sdltb_sqlite_entries(cursor, tables: list[str]) -> list[dict]:
                     if "conceptid" in col_l or col_l == "id":
                         concept_col = col
                 if term_col and concept_col:
-                    cursor.execute(f"SELECT {concept_col}, {term_col} FROM {table}")
-                    for row in cursor.fetchall():
+                    remaining = _MAX_SDLTB_ROWS - total_rows
+                    query = (
+                        f"SELECT {_quote_sqlite_identifier(concept_col)}, "
+                        f"{_quote_sqlite_identifier(term_col)} "
+                        f"FROM {_quote_sqlite_identifier(table)} LIMIT ?"
+                    )
+                    cursor.execute(query, (remaining + 1,))
+                    rows = cursor.fetchall()
+                    if len(rows) > remaining:
+                        raise _SDLTBLimitExceeded(f"术语行数超过 {_MAX_SDLTB_ROWS}")
+                    total_rows += len(rows)
+                    for row in rows:
                         cid = str(row[0])
                         term = str(row[1]).strip()
                         if cid not in entry_map:
                             entry_map[cid] = []
                         entry_map[cid].append((lang_code, term))
+            except _SDLTBLimitExceeded:
+                raise
             except Exception as exc:
                 logger.debug("表 %s 提取失败: %s", table, exc)
 

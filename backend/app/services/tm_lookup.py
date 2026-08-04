@@ -1,9 +1,10 @@
 """翻译记忆库查询服务：根据语种方向查找匹配的翻译记忆。"""
 from __future__ import annotations
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.core.database import SessionLocal
+from app.core.languages import language_pair_code
 from app.models.translation_memory import TranslationMemory
 
 
@@ -13,15 +14,11 @@ def lookup_tm(source_text: str, source_lang: str, target_lang: str, threshold: f
     使用简单的字符级相似度匹配。threshold 为匹配阈值（0~1），默认 0.8。
     返回格式：{"source_text": ..., "target_text": ..., "similarity": ...} 或 None
     """
-    lang_code_map = {
-        "zh": "zh", "zh-Hans": "zh", "zh-CN": "zh",
-        "zh-Hant": "zh", "zh-TW": "zh", "zh-HK": "zh",
-        "en": "en", "fr": "fr", "es": "es", "ru": "ru",
-        "ar": "ar", "ja": "ja", "ko": "ko", "de": "de",
-        "pt": "pt", "it": "it",
-    }
-    src = lang_code_map.get(source_lang, source_lang.split("-")[0])
-    tgt = lang_code_map.get(target_lang, target_lang.split("-")[0])
+    src = language_pair_code(source_lang)
+    tgt = language_pair_code(target_lang)
+    source_normalized = source_text.strip().lower()
+    if not source_normalized:
+        return None
 
     db = SessionLocal()
     try:
@@ -32,8 +29,30 @@ def lookup_tm(source_text: str, source_lang: str, target_lang: str, threshold: f
             condition = TranslationMemory.lang_pair.like(f"%→{tgt}")
         else:
             condition = TranslationMemory.lang_pair == f"{src}→{tgt}"
+        # 精确匹配优先走 (lang_pair, source_normalized) 唯一索引；命中后不再
+        # 调用 similarity，也不会加载任何候选集。
+        exact = db.scalar(
+            select(TranslationMemory)
+            .where(condition, TranslationMemory.source_normalized == source_normalized)
+            .order_by(TranslationMemory.updated_at.desc())
+            .limit(1)
+        )
+        if exact is not None:
+            return {
+                "source_text": exact.source_text,
+                "target_text": exact.target_text,
+                "similarity": 1.0,
+                "exact": True,
+            }
+        # 先让 PostgreSQL 的 pg_trgm similarity() 在数据库侧筛出最相近的
+        # 50 条，避免每个段落都把整个语对的 TM 记录加载到应用进程。
+        normalized_column = TranslationMemory.source_normalized
+        pg_similarity = func.similarity(normalized_column, source_normalized)
         entries = list(db.scalars(
-            select(TranslationMemory).where(condition)
+            select(TranslationMemory)
+            .where(condition, normalized_column.op("%")(source_normalized))
+            .order_by(pg_similarity.desc())
+            .limit(50)
         ))
     finally:
         db.close()
@@ -44,8 +63,6 @@ def lookup_tm(source_text: str, source_lang: str, target_lang: str, threshold: f
     # 计算字符级相似度
     best_match = None
     best_sim = 0.0
-    source_normalized = source_text.strip().lower()
-
     for entry in entries:
         entry_normalized = entry.source_text.strip().lower()
         sim = _char_similarity(source_normalized, entry_normalized)

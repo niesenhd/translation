@@ -5,13 +5,15 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, Integer, String, Text
+from sqlalchemy import CheckConstraint, DateTime, Enum, ForeignKey, Integer, String, Text, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
+from app.models.base import TimestampMixin
 
 
 class TaskStatus(str, enum.Enum):
+    UPLOADING = "uploading"
     QUEUED = "queued"
     RUNNING = "running"
     SUCCEEDED = "succeeded"
@@ -53,17 +55,31 @@ class FootnoteMode(str, enum.Enum):
     SKIP = "skip"                    # 脚注不翻译：保持英文原文
 
 
-class TranslationTask(Base):
+class TranslationTask(TimestampMixin, Base):
     __tablename__ = "translation_tasks"
+    __table_args__ = (
+        CheckConstraint(
+            "progress >= 0 AND progress <= 100",
+            name="ck_translation_tasks_progress",
+        ),
+    )
 
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    owner: Mapped[str] = mapped_column(String(128), index=True)
+    id: Mapped[str] = mapped_column(
+        Uuid(as_uuid=False), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    owner: Mapped[str] = mapped_column(
+        String(128), ForeignKey("users.username"), index=True
+    )
 
     original_filename: Mapped[str] = mapped_column(String(512))
     file_ext: Mapped[str] = mapped_column(String(16))
-    source_lang: Mapped[str] = mapped_column(String(16), default="auto")
+    source_lang: Mapped[str] = mapped_column(String(16), default="auto", server_default="auto")
     target_lang: Mapped[str] = mapped_column(String(16))
-    output_mode: Mapped[OutputMode] = mapped_column(Enum(OutputMode), default=OutputMode.PLAIN)
+    output_mode: Mapped[OutputMode] = mapped_column(
+        Enum(OutputMode, values_callable=lambda x: [e.value for e in x]),
+        default=OutputMode.PLAIN,
+        server_default=OutputMode.PLAIN.value,
+    )
     # 仅 PDF 文件使用；其他格式忽略此字段
     pdf_output_format: Mapped[PdfOutputFormat] = mapped_column(
         Enum(PdfOutputFormat, values_callable=lambda x: [e.value for e in x]),
@@ -93,9 +109,19 @@ class TranslationTask(Base):
     source_object: Mapped[str] = mapped_column(String(512))  # MinIO 中原文对象 key
     result_object: Mapped[str | None] = mapped_column(String(512), nullable=True)
 
-    status: Mapped[TaskStatus] = mapped_column(Enum(TaskStatus), default=TaskStatus.QUEUED, index=True)
-    progress: Mapped[int] = mapped_column(Integer, default=0)  # 0-100
+    status: Mapped[TaskStatus] = mapped_column(
+        Enum(TaskStatus, values_callable=lambda x: [e.value for e in x]),
+        default=TaskStatus.QUEUED,
+        server_default=TaskStatus.QUEUED.value,
+        index=True,
+    )
+    progress: Mapped[int] = mapped_column(Integer, default=0, server_default="0")  # 0-100
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    # 每次 worker 抢占任务都会生成新 attempt_id；所有心跳和收尾更新均须匹配它，
+    # 防止旧 worker 在重试或孤儿对账后覆盖新一轮执行结果。
+    attempt_id: Mapped[str | None] = mapped_column(
+        Uuid(as_uuid=False), nullable=True
+    )
+    heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )

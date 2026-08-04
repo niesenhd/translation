@@ -11,7 +11,7 @@ from sqlalchemy import select
 from app.core.config import get_settings
 from app.core.database import SessionLocal
 from app.core.security import CurrentUser, create_token, get_current_user, verify_password
-from app.models.user import User
+from app.models.user import AUTH_SOURCE_LOCAL, User
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +115,13 @@ def login(payload: LoginRequest, request: Request):
     finally:
         db.close()
     # 用户名/密码错误统一返回同一提示，避免账号枚举
-    if user is None or not user.is_active or not verify_password(payload.password, user.password_hash):
+    if (
+        user is None
+        or user.auth_source != AUTH_SOURCE_LOCAL
+        or bool(user.oa_id)
+        or not user.is_active
+        or not verify_password(payload.password, user.password_hash)
+    ):
         _record_login_failure(ip)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或密码错误")
     # 登录成功：清空该 IP 的失败计数

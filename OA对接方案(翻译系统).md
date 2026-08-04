@@ -1,6 +1,6 @@
-# 翻译系统 ↔ 律智荟 OA 对接方案
+# 文档翻译系统 ↔ 律智荟 OA 对接方案
 
-> 版本：v2.0 | 日期：2026-07-22 | 状态：✅ 双方已确认，准备开发
+> 版本：v2.1 | 日期：2026-08-04 | 状态：✅ 接口已实现，待生产配置与双方联调
 
 ---
 
@@ -9,7 +9,7 @@
 ```
 用户浏览器
 ┌─────────────────────────┐    ┌──────────────────────────────────────┐
-│   律智荟 OA（必智）      │    │  翻译系统                                │
+│   律智荟 OA（必智）      │    │  文档翻译系统                            │
 │   e.tylaw.com.cn        │    │  translation.tylaw.com.cn:8080 (HTTPS) │
 │                         │    │                                        │
 │  ┌─────────────────┐    │    │  ┌────────────────────┐               │
@@ -17,7 +17,11 @@
 │  │                 │    │    │  │                    │               │
 │  │  用户点击入口    │────┼────┼─>│ /api/sso/login     │               │
 │  │                 │    │ ①  │  │ (SSO 单点登录)      │               │
-│  │                 │<───┼────┼──│ 返回登录 token       │               │
+│  │                 │<───┼────┼──│ 返回 redirect_url     │               │
+│  │                 │    │    │  └────────────────────┘               │
+│  │                 │    │    │                                        │
+│  │                 │────┼────┼─>│ 浏览器打开 sso_code  │               │
+│  │                 │    │    │  │ 前端调用 /exchange  │               │
 │  │                 │    │    │  └────────────────────┘               │
 │  │                 │    │    │                                        │
 │  │                 │    │    │  ┌────────────────────┐               │
@@ -28,7 +32,8 @@
 │  └─────────────────┘    │    │                                        │
 └─────────────────────────┘    └────────────────────────────────────────┘
 
-① SSO 登录：律智荟服务器 POST 调我们的接口，传 loginName + 签名，我们返回登录 token
+① SSO 登录：律智荟服务器 POST 调我们的接口；响应只返回带 60 秒一次性 code 的绝对 redirect_url，
+   浏览器打开后由前端调用 /api/sso/exchange 兑换登录 token
 ② 用户同步：我们定时调律智荟 getemployees，同步在职人员到本地 users 表
 ```
 
@@ -45,6 +50,10 @@
 | 完整访问地址 | `https://translation.tylaw.com.cn:8080` |
 
 > 所有地址（前端页面、SSO 回调、API）统一使用 `https://translation.tylaw.com.cn:8080`，均带 8080 端口号。
+> Docker Compose 默认配置在 8080 提供 HTTP，仅用于本机/内网联调；生产必须启用
+> `frontend/nginx-ssl.conf.example` 并挂载证书。backend 8000、MinIO 9000/9001、PostgreSQL 5432、
+> Redis 6379 仅绑定服务器 `127.0.0.1`，不对其他主机开放。`PUBLIC_BASE_URL` 必须精确设置为上述
+> HTTPS 根地址。
 
 ---
 
@@ -57,13 +66,16 @@
 2. 律智荟服务器 POST 调用我们的接口：
    POST https://translation.tylaw.com.cn:8080/api/sso/login
    Body: { "loginName": "zhangsan", "timestamp": 1722326494123, "sign": "xxx" }
-3. 我们验证签名 → 查本地 users 表 → 返回登录 token
-4. 律智荟拿到 token，带用户浏览器跳转到：
-   https://translation.tylaw.com.cn:8080/?token=xxx
-5. 用户无感知进入翻译系统
+3. 我们验证签名、防重放并检查本地 OA 用户 → 返回：
+   { "success": true, "redirect_url": "https://translation.tylaw.com.cn:8080/?sso_code=xxx" }
+4. 律智荟用用户浏览器打开 redirect_url
+5. 前端先从地址栏移除 sso_code，再调用：
+   POST https://translation.tylaw.com.cn:8080/api/sso/exchange
+   Body: { "code": "xxx" }
+6. 兑换成功后返回 7 天登录 token，用户无感知进入文档翻译系统
 ```
 
-### 我们提供给律智荟的接口
+### 3.1 律智荟服务器调用登录接口
 
 | 项 | 说明 |
 |----|------|
@@ -93,42 +105,72 @@
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | success | bool | 固定为 true |
-| token | string | 登录 token（有效期 **7 天**，过期后需重新走 SSO 流程） |
-| redirect_url | string | 带上 token 的前端跳转地址，直接用浏览器打开即可登录 |
+| redirect_url | string | 带 60 秒一次性 `sso_code` 的**绝对**前端地址，律智荟直接用浏览器打开 |
 
 ```json
 {
   "success": true,
-  "token": "eyJ1Ijoi...",
-  "redirect_url": "https://translation.tylaw.com.cn:8080/?token=eyJ1Ijoi..."
+  "redirect_url": "https://translation.tylaw.com.cn:8080/?sso_code=one-time-code"
 }
 ```
 
-**错误响应（统一 JSON 格式）：**
+> `/api/sso/login` 的成功响应严格只有 `success`、`redirect_url`；不得增加或返回登录 token。
+
+**错误响应（FastAPI 标准格式）：**
 
 ```json
 {
-  "success": false,
   "detail": "签名校验失败"
 }
 ```
 
 | HTTP 状态码 | detail 内容 | 触发条件 |
 |------------|------------|---------|
-| 400 | `缺少必填参数：loginName / timestamp / sign` | 请求体中任一必填字段缺失 |
+| 422 | 参数校验详情 | 请求体缺字段、字段类型或长度不符合 schema |
 | 400 | `时间戳格式错误，需为 13 位毫秒级` | timestamp 不是合法的 13 位数字 |
 | 401 | `签名校验失败` | HMAC-SHA256 验证不通过 |
 | 401 | `时间戳已过期` | timestamp 与服务器时间差超过 5 分钟（300 秒） |
-| 404 | `用户不存在或已离职：{loginName}` | 本地 users 表无此 loginName 或 is_active=False |
-| 500 | `服务器内部错误` | 意外异常 |
+| 401 | `SSO 请求已使用或正在处理` | 同一签名请求在防重放窗口内再次提交 |
+| 404 | `用户不存在或已离职：{loginName}` | 用户不存在、非 OA 身份、`is_active=false` 或 `oa_employed=false` |
+| 500 | `SSO 密钥未配置` / `PUBLIC_BASE_URL 未配置` | 生产配置缺失 |
+| 503 | `SSO 服务暂不可用，请稍后重试` | Redis 防重放或一次性 code 存储不可用（安全失败） |
 
-> timestamp 使用 **UTC 时间**（非北京时间），与必智接口文档中 generateToken 的时间戳标准一致（毫秒级 Unix 时间戳）。
+> timestamp 是 13 位毫秒级 Unix 时间戳，表示绝对时刻，本身没有时区。这不是“使用 UTC 而不是北京时间”：双方直接取当前 Unix epoch 毫秒值，不做 UTC+8 或任何额外偏移。
+
+### 3.2 浏览器前端调用 code 兑换接口
+
+此接口由文档翻译系统前端调用，不需要律智荟服务器代为调用。
+
+| 项 | 说明 |
+|----|------|
+| **接口地址** | `POST https://translation.tylaw.com.cn:8080/api/sso/exchange` |
+| **Content-Type** | `application/json` |
+| **请求体** | `{ "code": "从 redirect_url 取得的一次性 code" }` |
+| **code 有效期** | 60 秒 |
+| **使用次数** | 最多成功一次；服务端原子读取并删除 |
+
+**成功响应（HTTP 200）：**
+
+```json
+{
+  "token": "7-day-login-token",
+  "username": "zhangsan",
+  "is_admin": false,
+  "display_name": "张三"
+}
+```
+
+`display_name` 可为 `null`。code 无效、已使用、已过期，或兑换时用户已失去登录资格，均返回
+HTTP 401：`{"detail":"SSO code 无效、已使用或已过期"}`。Redis 不可用时返回 HTTP 503。
+
+> 前端必须在兑换请求前用 `history.replaceState` 从地址栏移除 `sso_code`，避免一次性 code 长时间留在
+> 浏览器历史。真正的 7 天登录 token 只出现在兑换响应中，不进入 URL。
 
 ### 签名规则
 
 | 项 | 说明 |
 |----|------|
-| **签名密钥（SSO 专用）** | `u2DWyb5vm0Dby1ndNeeHJNE57uutJYOoAoN74sP5nXfGFT4AyI7JSc6AQLDe8NEZ` |
+| **签名密钥（SSO 专用）** | 使用双方现有 SSO Secret，永久保留、不轮换；只通过受控环境变量注入，不写入文档或代码仓库 |
 | 签名算法 | HMAC-SHA256 |
 | 签名串拼接 | `loginName + timestamp`（无分隔符，直接拼接） |
 | 签名结果 | Base64 编码 |
@@ -149,8 +191,12 @@ sign = Base64( HMAC-SHA256(secretKey, "zhangsan1722326494123") )
 
 Python:
 ```python
-import hmac, hashlib, base64
-secret = "u2DWyb5vm0Dby1ndNeeHJNE57uutJYOoAoN74sP5nXfGFT4AyI7JSc6AQLDe8NEZ"
+import base64
+import hashlib
+import hmac
+import os
+
+secret = os.environ["OA_SSO_SECRET"]
 sign_str = f"{'zhangsan'}{1722326494123}"
 sign = base64.b64encode(hmac.new(secret.encode(), sign_str.encode(), hashlib.sha256).digest()).decode()
 ```
@@ -158,7 +204,7 @@ sign = base64.b64encode(hmac.new(secret.encode(), sign_str.encode(), hashlib.sha
 C#:
 ```csharp
 using System.Security.Cryptography;
-var secret = "u2DWyb5vm0Dby1ndNeeHJNE57uutJYOoAoN74sP5nXfGFT4AyI7JSc6AQLDe8NEZ";
+var secret = Environment.GetEnvironmentVariable("OA_SSO_SECRET");
 var signStr = "zhangsan" + "1722326494123";
 using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
 var hash = hmac.ComputeHash(Encoding.UTF8.GetBytes(signStr));
@@ -170,7 +216,7 @@ Java:
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.util.Base64;
-String secret = "u2DWyb5vm0Dby1ndNeeHJNE57uutJYOoAoN74sP5nXfGFT4AyI7JSc6AQLDe8NEZ";
+String secret = System.getenv("OA_SSO_SECRET");
 String signStr = "zhangsan" + "1722326494123";
 Mac mac = Mac.getInstance("HmacSHA256");
 mac.init(new SecretKeySpec(secret.getBytes("UTF-8"), "HmacSHA256"));
@@ -187,9 +233,9 @@ String sign = Base64.getEncoder().encodeToString(mac.doFinal(signStr.getBytes("U
 | 请求方式 | POST |
 | Content-Type | application/json |
 | 请求参数 | loginName（登录名）、timestamp（13位毫秒时间戳）、sign（签名） |
-| 签名密钥 | `u2DWyb5vm0Dby1ndNeeHJNE57uutJYOoAoN74sP5nXfGFT4AyI7JSc6AQLDe8NEZ` |
+| 签名密钥 | 使用现有 `OA_SSO_SECRET`，通过受控环境变量配置，禁止写入仓库 |
 | 签名方式 | HMAC-SHA256，签名串 = `loginName + timestamp`，Base64 输出 |
-| 返回值 | success、token、redirect_url（用此 URL 跳转浏览器） |
+| 返回值 | 仅 `success`、`redirect_url`（用此 URL 跳转浏览器） |
 
 ---
 
@@ -211,12 +257,12 @@ Celery Beat 定时任务（工作时段 9:00-18:00，每 3 小时同步一次）
   │      Headers: S-App-Key, S-Auth-Token, S-Timestamp
   │      Body: { PageNumber: 1, PageSize: 1000 }
   │
-  ├── 3. 过滤 Status="A" 且 InServiceStatus="在职" 的人员
+  ├── 3. 根据 Status="A" 且 InServiceStatus="在职" 计算 oa_employed
   │
   ├── 4. 与本地 users 表比对：
-  │      - 新人员 → 自动创建账号（初始随机密码）
+  │      - 新人员 → 自动创建 OA 专用账号（不创建本地密码，只能走 SSO）
   │      - 已有人员 → 更新姓名/邮箱/部门
-  │      - 离职人员 → is_active=False（不删除，保留历史数据）
+  │      - 离职人员 → oa_employed=False（不删除，保留历史数据；is_active 保留本地管理语义）
   │
   └── 5. 记录同步日志
 ```
@@ -226,10 +272,13 @@ Celery Beat 定时任务（工作时段 9:00-18:00，每 3 小时同步一次）
 | 项 | 值 |
 |----|-----|
 | **律智荟 API baseUrl** | `https://e.tylaw.com.cn` |
-| **AppKey** | `app_d5ac8f3b0f0b4bb59a9495c15856bebc` |
-| **SecretKey** | `ZXvcmYMMPYUVqTatM5akv5QrwXiR7B5b12x+EzTjKpU=` |
+| **AppKey** | 使用现有值，部署时从受控 `OA_APP_KEY` 注入；文档仅写占位符 |
+| **SecretKey** | 使用现有值，部署时从受控 `OA_APP_SECRET` 注入；文档仅写占位符 |
+| **SSO Secret** | 使用现有值，部署时从受控 `OA_SSO_SECRET` 注入；文档仅写占位符 |
 
-> 此凭证由必智提供，用于我方调用律智荟的 generateToken / getemployees 接口。
+> 现有 AppKey、AppSecret、SSO Secret 已确定**永久保留，不轮换、不改值**。真实值只能存在于权限受控的
+> `deploy/.env` 或部署密钥系统中，不得出现在本文、示例、日志、截图或代码仓库。AppKey/AppSecret 用于
+> generateToken / getemployees；SSO Secret 用于验证 `/api/sso/login` 签名。
 
 ### 律智荟接口注意事项
 
@@ -251,27 +300,27 @@ Celery Beat 定时任务（工作时段 9:00-18:00，每 3 小时同步一次）
 | Email | email | 邮箱 |
 | Phone | phone | 手机号 |
 | Department | department | 部门 |
-| Category | role | 角色（律师/助理等） |
-| Status="A" + InServiceStatus="在职" | is_active=True | 在职状态 |
+| Category | — | 当前版本不落库；后续如启用 OA 角色映射需另行确认规则 |
+| Status="A" + InServiceStatus="在职" | oa_employed=True | OA 在职状态；其他情况为 false，SSO 与普通登录鉴权均拒绝 OA 离职账号 |
 
 ---
 
 ## 五、完整调用流程示例
 
-### 场景：用户张三从律智荟进入翻译系统
+### 场景：用户张三从律智荟进入文档翻译系统
 
 ```
 步骤 1：律智荟准备签名
   loginName  = "zhangsan"
   timestamp  = 1722326494123（当前毫秒时间戳）
-  secret     = "u2DWyb5vm0Dby1ndNeeHJNE57uutJYOoAoN74sP5nXfGFT4AyI7JSc6AQLDe8NEZ"
+  secret     = getenv("OA_SSO_SECRET")
   signString = "zhangsan1722326494123"
   sign       = Base64(HMAC-SHA256(secret, signString))
 
 步骤 2：律智荟 POST 调用
   POST https://translation.tylaw.com.cn:8080/api/sso/login
   Content-Type: application/json
-  
+
   {
     "loginName": "zhangsan",
     "timestamp": 1722326494123,
@@ -281,12 +330,27 @@ Celery Beat 定时任务（工作时段 9:00-18:00，每 3 小时同步一次）
 步骤 3：我方返回
   {
     "success": true,
-    "token": "eyJ1IjoiemhhbmdzYW4iLCJleHA...",
-    "redirect_url": "https://translation.tylaw.com.cn:8080/?token=eyJ1IjoiemhhbmdzYW4iLCJleHA..."
+    "redirect_url": "https://translation.tylaw.com.cn:8080/?sso_code=one-time-code"
   }
 
 步骤 4：律智荟跳转浏览器
-  用户浏览器打开 redirect_url → 自动登录翻译系统 → 进入任务页面
+  用户浏览器打开 redirect_url
+
+步骤 5：文档翻译系统前端移除地址栏中的 sso_code，并兑换登录 token
+  POST https://translation.tylaw.com.cn:8080/api/sso/exchange
+  Content-Type: application/json
+
+  { "code": "one-time-code" }
+
+步骤 6：我方返回登录信息
+  {
+    "token": "7-day-login-token",
+    "username": "zhangsan",
+    "is_admin": false,
+    "display_name": "张三"
+  }
+
+步骤 7：前端保存会话 → 进入任务页面
 ```
 
 ---
@@ -300,11 +364,13 @@ Celery Beat 定时任务（工作时段 9:00-18:00，每 3 小时同步一次）
 | 1 | SSO 用户标识字段 | **loginName**（唯一登录名） |
 | 2 | SSO 签名密钥 | **SSO 专用密钥**（我方提供，见第三节） |
 | 3 | 签名算法 | **HMAC-SHA256**，签名串 = `loginName + timestamp`，Base64 输出 |
-| 4 | 跳转方式 | `https://translation.tylaw.com.cn:8080/?token=xxx` |
+| 4 | 跳转方式 | `https://translation.tylaw.com.cn:8080/?sso_code=xxx`；code 60 秒有效且单次使用 |
 | 5 | 接口地址 | `https://translation.tylaw.com.cn:8080/api/sso/login` |
 | 6 | 用户同步频率 | 工作时段 9:00-18:00 每 3 小时（共 4 次/天） |
 | 7 | 数据同步方向 | 我方主动调律智荟 getemployees |
 | 8 | SSO 方式 | POST API 调用（律智荟服务器调我方接口） |
+| 9 | 登录响应 | `/api/sso/login` 仅返回 `success`、`redirect_url`；登录 token 由前端调用 `/api/sso/exchange` 获得 |
+| 10 | OA 凭据 | 现有 AppKey、AppSecret、SSO Secret 永久保留、不轮换；文档只写占位符 |
 
 ### ⚠️ 域名生效前注意
 

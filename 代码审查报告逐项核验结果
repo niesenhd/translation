@@ -1,0 +1,92 @@
+# 代码审查报告逐项核验结果
+
+> 同步日期：2026-08-04
+> 本文保留原 #1–64 编号，与 [代码审查报告.md](./代码审查报告.md) 一致。为避免后续修改导致错误定位，仅引用文件或符号，不使用绝对路径行号链接。
+
+## 逐项结论
+
+| # | 最新结论 | 核验摘要 |
+|---|---|---|
+| 1 | 边界已确认 | OA 文档/仓库已改占位符；现有 AppKey、AppSecret、SSO Secret 永久保留且不轮换 |
+| 2 | 已修复 | 安装脚本随机生成 Redis 密码，不打印明文，生产守卫拒绝弱配置 |
+| 3 | 已修复 | SDLTB 标识符转义 + query-only + 扩展/规模/时间限制 |
+| 4 | 已修复 | 反馈创建按 `task_id + owner` 查询，普通用户越权返回 404 |
+| 5 | 误报，关闭 | python-pptx 1.0.2 支持 `run.font.language_id`；只增加/保留 RTL 回归验收 |
+| 6 | 误报，已显式收敛 | icons 依赖已直接声明，锁文件已生成，使用 `npm ci` |
+| 7 | 已修复 | Celery late ack、worker-lost reject 和 attempt 条件更新 |
+| 8 | 已修复 | 独立心跳覆盖全执行流程，同时续 Redis/DB 租约 |
+| 9 | 已修复 | OA 账号无本地密码且仅 SSO，同名本地账号不覆盖 |
+| 10 | 已修复 | TM 归一化精确索引 + `pg_trgm` 最多 50 条候选 |
+| 11 | 已修复，待性能验收 | 已移除逐 span `get_pixmap` 背景采样 |
+| 12 | 已修复 | 模型配置读取已移到 service 层，消除 translator/OCR 对 API 层的反向依赖 |
+| 13 | 已修复，待样本验收 | DOCX 遍历整个包的图片 relationship，相同 part 只 OCR 一次 |
+| 14 | 已修复 | API Key 用独立数据密钥/Fernet 加密且不回显；迁移须保留所有地址和 Key |
+| 15 | 已修复 | 分块上传、受限临时文件和 200MB 应用层上限 |
+| 16 | 已修复 | `uploading` 记录先建立，失败时清理对象并标记任务 |
+| 17 | 已修复 | 统一语言白名单 |
+| 18 | 已修复 | OA 同步返回契约一致，本地同名冲突记录/告警 |
+| 19 | 已修复 | 开关 API 失败时回滚 UI 并提示 |
+| 20 | 非缺陷，已增强 | 原需求未要求下载进度；当前已增加进度和取消 |
+| 21 | 已修复 | Nginx CSP、frame-ancestors、nosniff、Referrer-Policy 等安全头 |
+| 22 | 已修复 | 枚举统一存 value |
+| 23 | 已修复 | 新 Schema 建立任务/反馈/TM 外键与删除策略 |
+| 24 | 已修复 | 统一 UTC timezone-aware 时间 |
+| 25 | 已修复 | 不再使用 `datetime.utcnow()` |
+| 26 | 已修复 | `TimestampMixin` + DB `server_default` |
+| 27 | 已按业务语义收敛 | `oa_id IS NOT NULL` 部分唯一；email 不强制唯一 |
+| 28 | 已修复 | 术语/TM 归一化列、复合唯一约束与索引 |
+| 29 | 已修复 | XLSX 公式仅处理 Tokenizer RANGE token |
+| 30 | 已修复，待 PDF 回归 | redaction 只删文字，不处理图片/矢量图，不填背景 |
+| 31 | 已修复，待格式回归 | `.xls` 先受限 LibreOffice 转 `.xlsx`，失败明确报错 |
+| 32 | 已修复 | 术语/TM 使用 UPSERT，每模型类型最多一个 active 由 DB 约束保证 |
+| 33 | 已修复 | 生产 CORS 明确白名单 |
+| 34 | 已修复 | SSO 单次 code 兑换，token 不进 URL |
+| 35 | 已修复 | 管理异步操作统一错误提示 |
+| 36 | 已修复 | 具名 resize 回调且卸载时移除 |
+| 37 | 已修复 | 单项安全删除增加确认 |
+| 38 | 已修复 | 默认 30 秒，上传/术语导入 10 分钟 |
+| 39 | 已修复 | 任务分页契约与当前页轮询 |
+| 40 | 已修复 | 筛选/搜索重置页码 |
+| 41 | 已修复 | Alembic 取代 `create_all + _ensure_columns()` |
+| 42 | 已修复 | 安装脚本不再卸载 fail2ban 或改主机 iptables 默认策略 |
+| 43 | 已修复 | 200MB 应用上限与 Nginx 201m 协议余量已文档化 |
+| 44 | 已修复 | 输出不再宣称回环端口可从外部访问 |
+| 45 | 已修复 | 应用非 root + no-new-privileges + cap_drop |
+| 46 | 大部分已修复 | `uv.lock`、`package-lock.json`、`npm ci` 和版本固定已完成；发布镜像 digest 待最终清单锁定 |
+| 47 | 已修复 | backend/frontend 独立 `.dockerignore` |
+| 48 | 已修复 | Redis 异常时并发闸门 fail-closed |
+| 49 | 误报，关闭 | Celery 显式使用 Asia/Shanghai，不修改现有时区配置 |
+| 50 | 已修复 | Redis client/pool 进程级单例 + PID fork 保护 |
+| 51 | 已修复 | `total_users` 统计 users 表 |
+| 52 | 不修，非缺陷 | 不为形式指标增加无用 `__repr__` |
+| 53 | 已修复 | PostgreSQL UUID |
+| 54 | 已修复 | 统一语言映射 |
+| 55 | 已修复 | 统一跳过翻译谓词 |
+| 56 | 部分收敛，仍属技术债 | 手动 Session 均明确关闭，但 API 层仍混用依赖注入与手动 `SessionLocal()` |
+| 57 | 已修复 | 公共 TimestampMixin |
+| 58 | 已修复 | rating/progress CheckConstraint |
+| 59 | 已修复 | 前端 catch-all 404 |
+| 60 | 已收敛 | Admin 组件样式迁入 scoped CSS |
+| 61 | 已修复 | Admin 拆分为用户、模型、术语/TM、反馈、统计组件 |
+| 62 | 已修复 | gzip、hash 资源一年缓存、`index.html` 不缓存 |
+| 63 | 已修复 | edge/data/egress 网络分段 |
+| 64 | 已修复 | `CELERY_WORKER_CONCURRENCY` 环境变量 |
+
+## 报告外补充核验
+
+| 项目 | 最新状态 |
+|---|---|
+| OA 离职用户登录 | `oa_employed` 与 `is_active` 分离；SSO 和每次 API 鉴权均复查 OA 身份/在职/手动禁用状态 |
+| 单文件下载 | MinIO 流式转发，响应结束/断开时关闭连接 |
+| 批量下载 | 磁盘临时 ZIP，最多 100 个、总逻辑大小 2GiB，完成/异常后清理 |
+| SSO 响应 | `/api/sso/login` 仅返回 `success` 和带 `sso_code` 的绝对 `redirect_url` |
+| SSO 防重放/兑换 | 签名指纹 Redis `SET NX EX 300`；code 256 位随机、60 秒 TTL、`GETDEL` 单次消费 |
+| 排队与 ETA | SQL 窗口函数批量计算位置，ETA 结合 RUNNING、空闲槽位与历史平均耗时 |
+| 模型配置迁移 | 导出/导入覆盖 `model_configs` 与旧版 `system_config`；必须保留所有 API 地址、API Key、类型和启用状态，以受控指纹/密文往返验证，不显示真值 |
+
+## 仍未完成或待验收
+
+- PDF 阿拉伯语只有基础右对齐和字体回退，连字、双向文字整形与复杂混排仍未完成。
+- 统计看板仍缺模型维度的使用次数和平均耗时；结构化日志属 P4 未完成项。
+- 当前使用 DashScope 且构建需联网，纯内网/完全离线仍是 P5 目标，不得宣称已实现。
+- 静态实现尚需指定服务器的测试、数据迁移演练、工作进程故障注入、RSS/TM 性能和格式回归验收。本机和 GitHub 不运行测试或模拟环境。

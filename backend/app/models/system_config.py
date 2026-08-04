@@ -4,22 +4,18 @@ P0 阶段仅用于「文件保留天数」一项，结构通用便于后续扩�
 """
 from __future__ import annotations
 
-from datetime import datetime
-
-from sqlalchemy import DateTime, String
+from sqlalchemy import String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
+from app.models.base import TimestampMixin
 
 
-class SystemConfig(Base):
+class SystemConfig(TimestampMixin, Base):
     __tablename__ = "system_config"
 
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     value: Mapped[str] = mapped_column(String(512))
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow
-    )
     updated_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
 

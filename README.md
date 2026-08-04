@@ -1,8 +1,8 @@
-# 法律文档翻译系统
+# 文档翻译系统
 
-面向律所内部的多格式文档翻译系统（私有化部署 / 纯内网）。
+面向律所内部的多格式文档翻译系统。当前试用阶段使用 DashScope；P5 切换本地模型并完成离线验收后达到私有化纯内网目标。
 
-> 详见 [需求总结](./法律文档翻译软件%20—%20需求总结.md)
+> 详见 [需求总结](./文档翻译软件%20—%20需求总结.md)
 
 ## 目录结构
 
@@ -31,7 +31,7 @@ translation/
 └── README.md
 ```
 
-## 当前阶段：P2（核心功能已完成）
+## 当前阶段：P2 核心功能已完成，P3 OA 接口待生产联调
 
 - [x] 项目骨架 + docker-compose（PostgreSQL / Redis / MinIO）
 - [x] FastAPI 后端 + 本地用户认证（用户名/密码登录 + pbkdf2 哈希 + HMAC 签名 Token）
@@ -49,13 +49,38 @@ translation/
 - [x] **两遍法精译模式**（翻译 + 法律译审复核两遍，术语一致性与法律文体更准）
 - [x] **脚注处理选项**（双语 / 仅译文 / 不翻译，仅双语模式生效）
 - [x] **翻译质量反馈闭环**（用户评分/建议 → 管理员审核 → 一键采纳录入术语库/TM）
-- [x] 阿拉伯语 RTL 排版（DOCX/PDF/PPTX 全格式 RTL 支持）
+- [x] 阿拉伯语 RTL 排版（DOCX/PPTX）
+- [ ] PDF 阿拉伯语完整 RTL 支持（目前仅有基础右对齐与字体回退；连字、双向文字整形和复杂混排尚待实现与验收）
 - [x] 并发闸门安全（Redis ZSET + TTL 自愈，强杀不泄漏、beat/多 worker 不误清）
 - [x] **孤儿任务自动对账**（Beat 每 5 分钟检测卡死 RUNNING 的任务并标记 FAILED）
 - [x] API 限流防护（SDK 重试禁用 + 应用层指数退避 5-60s）
 - [x] **登录防爆破**（Redis IP 级限速：5 分钟内失败 5 次锁定 15 分钟）
 - [x] 400 拒绝预检（纯数字/符号段落跳过，不浪费 API 调用）
 - [x] **生产密钥安全守卫**（APP_ENV=production 时拒绝默认密钥启动）
+- [x] 律智荟 SSO（签名防重放 + 60 秒一次性 code 兑换）与定时人员同步接口
+
+## 当前接口契约
+
+- `POST /api/sso/login` 请求体为
+  `{"loginName":"...","timestamp":1722326494123,"sign":"..."}`，成功响应**仅**包含
+  `{"success":true,"redirect_url":".../?sso_code=..."}`，不会返回登录 token。
+- `sso_code` 有效期 60 秒且只能成功使用一次。浏览器随后调用
+  `POST /api/sso/exchange`，请求体为 `{"code":"..."}`，兑换 7 天登录 token；前端会先从地址栏移除
+  `sso_code` 再发起兑换。
+- `GET /api/tasks?page=1&page_size=20` 返回
+  `{"items":[...],"total":0,"page":1,"page_size":20}`。`page` 从 1 开始，`page_size`
+  取值 1–100；普通用户仅看到自己的非删除任务，管理员可看到全部非删除任务。
+
+## 数据与凭据保留
+
+- 升级、迁移或重建环境时，必须迁移并核验全部模型配置，包括模型 ID、API 地址、API Key、模型类型和
+  启用状态；旧版 `system_config` 中的模型相关配置也必须保留。API Key 属于敏感数据，只能进入受控的
+  迁移包或部署密钥存储，不得写入文档、日志或仓库。
+- 律智荟现有 `OA_APP_KEY`、`OA_APP_SECRET`、`OA_SSO_SECRET` 已确定永久保留，**不轮换、不改值**。
+  仓库和所有文档只使用占位符，真实值仅从受控的 `deploy/.env` 或部署密钥系统注入。
+- 迁移和部署步骤见 [deploy/STARTUP.md](./deploy/STARTUP.md)，历史凭据清理边界见
+  [deploy/SECRET_REMEDIATION.md](./deploy/SECRET_REMEDIATION.md)。
+- GitHub Actions 不运行应用测试或构建；功能测试、迁移演练、镜像构建和端到端验收只在指定服务器执行。
 
 ## 维护变更记录
 
@@ -158,12 +183,6 @@ translation/
   封顶 8192）——不设走 DashScope 偏小默认值，长段落译文被中途截断（NVCA 多段砍到半句）；
   finish_reason=length 检测放大重试；空译文重试兜底。该修复对自部署模型同样适用。
 
-> **关于私有化部署 / 数据保密**：当前翻译走 DashScope 云端 API。model_configs 本就支持任意
-> OpenAI 兼容端点（api_base_url + api_key + model_id）。正式应用若要求数据不出内网，可在律所
-> 内网 GPU 服务器上用 vLLM 部署开源翻译模型 **Hunyuan-MT-7B / HY-MT1.5-7B**（腾讯开源，WMT25 冠军，
-> 支持术语干预），在管理后台新增一条模型配置指向本地 vLLM 端点即可，无需改代码。Qwen-MT 翻译
-> 质量好但属 DashScope 纯云端服务、不开源，仅适合用免费额度做 A/B 基准，**不能**作为保密场景生产模型。
-
 > **关于私有化部署 / 数据保密**：当前翻译走 DashScope 云端 API。模型配置（model_configs）
 > 本就支持任意 OpenAI 兼容端点（api_base_url + api_key + model_id）。正式应用若要求
 > 数据不出内网，可在律所内网 GPU 服务器上用 vLLM 部署开源翻译模型 **Hunyuan-MT-7B /
@@ -252,14 +271,22 @@ translation/
 ```bash
 # 1. 复制环境变量
 cp deploy/.env.example deploy/.env
-# 编辑 deploy/.env，填入 DASHSCOPE_API_KEY
+# 编辑 deploy/.env，至少设置生产级应用密钥、数据加密密钥、数据库/Redis/MinIO 密码和模型配置
 
 # 2. 启动基础设施 + 服务
 cd deploy
-docker compose up -d
+docker compose up -d --build
 
 # 3. 访问
-# 前端: http://localhost:8080
-# 后端 API: http://localhost:8000/docs
-# MinIO Console: http://localhost:9001
+# 对外入口（默认 HTTP）: http://localhost:8080
+# 以下仅能在服务器本机访问：
+# 后端 API/Swagger: http://127.0.0.1:8000/docs
+# MinIO Console: http://127.0.0.1:9001
+# PostgreSQL: 127.0.0.1:5432
+# Redis: 127.0.0.1:6379
 ```
+
+默认 `frontend/nginx.conf` 在 8080 提供 HTTP。律智荟生产环境要求
+`https://translation.tylaw.com.cn:8080`，需启用 `frontend/nginx-ssl.conf.example`、挂载证书，并把
+`PUBLIC_BASE_URL` 精确设置为该外部根地址；80/443 不开放。后端、MinIO、PostgreSQL 和 Redis 不应直接
+暴露给内网其他主机。

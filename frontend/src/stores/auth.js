@@ -36,7 +36,7 @@ export const useAuthStore = defineStore('auth', {
         return false
       }
     },
-    logout() {
+    clearSession() {
       this.token = ''
       this.username = ''
       this.is_admin = false
@@ -45,6 +45,9 @@ export const useAuthStore = defineStore('auth', {
       localStorage.removeItem('username')
       localStorage.removeItem('is_admin')
       localStorage.removeItem('display_name')
+    },
+    logout() {
+      this.clearSession()
       window.location.href = '/login'
     },
   },

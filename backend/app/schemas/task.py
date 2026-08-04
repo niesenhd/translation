@@ -35,3 +35,10 @@ class TaskRead(BaseModel):
     queue_position: Optional[int] = None
     # 预计等待时间（秒，仅 QUEUED 状态有值）
     estimated_wait_seconds: Optional[int] = None
+
+
+class TaskPage(BaseModel):
+    items: list[TaskRead]
+    total: int
+    page: int
+    page_size: int

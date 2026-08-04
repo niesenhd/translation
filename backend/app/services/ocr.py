@@ -28,7 +28,8 @@ from openai import OpenAI
 from openai import APIError, APITimeoutError, RateLimitError
 
 from app.core.config import get_settings
-from app.services.translator import resolve_language_name
+from app.core.languages import resolve_language_name
+from app.services.text_rules import should_skip_translation
 
 logger = logging.getLogger(__name__)
 
@@ -83,15 +84,12 @@ def _get_client() -> OpenAI:
         with _client_lock:
             if _client is None:  # double-check
                 settings = get_settings()
-                # 优先从 model_configs 表读取激活的 VL 模型配置
-                from app.api.model_configs import get_active_vl_config
-                active = get_active_vl_config()
-                if active:
-                    api_key = active.api_key
-                    base_url = active.api_base_url
-                else:
-                    api_key = settings.dashscope_api_key
-                    base_url = settings.dashscope_base_url
+                from app.models.model_config import ModelType
+                from app.services.model_config_service import get_runtime_model_config
+
+                active = get_runtime_model_config(ModelType.VL, settings)
+                api_key = active.api_key
+                base_url = active.api_base_url
                 _client = OpenAI(
                     api_key=api_key,
                     base_url=base_url,
@@ -126,10 +124,11 @@ def _call_vl(prompt: str, image_bytes: bytes, mime: str = "image/png") -> str:
     if not image_bytes:
         return ""
 
-    # 获取 VL 模型 ID
-    from app.api.model_configs import get_active_vl_config
-    active = get_active_vl_config()
-    vl_model = active.model_id if active else settings.dashscope_vl_model
+    # 模型配置统一从 service 层读取，避免服务层反向依赖 API 路由。
+    from app.models.model_config import ModelType
+    from app.services.model_config_service import get_runtime_model_config
+
+    vl_model = get_runtime_model_config(ModelType.VL, settings).model_id
 
     b64 = base64.b64encode(image_bytes).decode("ascii")
     image_url = f"data:{mime};base64,{b64}"
@@ -351,30 +350,8 @@ def _ocr_image_regions_vl(
 
 
 def _should_skip_translation(text: str) -> bool:
-    """判断文本是否不需要翻译（纯数字、公式、日期等）。"""
-    import re as _re
-    text = text.strip()
-    if not text:
-        return True
-    # 纯数字（含小数、百分号、货币符号）
-    if _re.match(r'^[\d\s,.%$€¥£₹+\-]+$', text):
-        return True
-    # 日期格式
-    if _re.match(r'^\d{4}[-/]\d{1,2}[-/]\d{1,2}$', text):
-        return True
-    # 时间格式
-    if _re.match(r'^\d{1,2}:\d{2}(:\d{2})?$', text):
-        return True
-    # 邮箱
-    if _re.match(r'^[\w.+-]+@[\w-]+\.[\w.]+$', text):
-        return True
-    # URL
-    if _re.match(r'^https?://', text):
-        return True
-    # 版本号
-    if _re.match(r'^v?\d+\.\d+', text, _re.IGNORECASE):
-        return True
-    return False
+    """向后兼容旧导入路径；实际规则由 text_rules 统一维护。"""
+    return should_skip_translation(text)
 
 
 def _batch_translate(

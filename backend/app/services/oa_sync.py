@@ -12,8 +12,7 @@ from sqlalchemy import select
 
 from app.core.config import get_settings
 from app.core.database import SessionLocal
-from app.core.security import hash_password
-from app.models.user import User
+from app.models.user import AUTH_SOURCE_OA, User
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +66,8 @@ def sync_users_from_oa() -> dict:
     """从律智荟同步人员数据到本地 users 表。
 
     Returns:
-        {"synced": int, "created": int, "updated": int, "deactivated": int}
+        {"synced": int, "created": int, "updated": int, "employed_changed": int,
+         "conflicts": int, "conflict_usernames": list[str]}
     """
     settings = get_settings()
     base_url = settings.oa_base_url
@@ -76,7 +76,14 @@ def sync_users_from_oa() -> dict:
 
     if not app_key or not app_secret:
         logger.warning("OA 同步跳过：AppKey/AppSecret 未配置")
-        return {"synced": 0, "created": 0, "updated": 0, "deactivated": 0}
+        return {
+            "synced": 0,
+            "created": 0,
+            "updated": 0,
+            "employed_changed": 0,
+            "conflicts": 0,
+            "conflict_usernames": [],
+        }
 
     # 1. 获取 Saury token
     token, ts = _generate_token(base_url, app_key, app_secret)
@@ -98,31 +105,64 @@ def sync_users_from_oa() -> dict:
     created = 0
     updated = 0
     employed_changed = 0
+    conflict_usernames: list[str] = []
 
     db = SessionLocal()
     try:
+        existing_users = list(db.scalars(select(User)))
+        users_by_username = {user.username: user for user in existing_users}
+        users_by_oa_id = {user.oa_id: user for user in existing_users if user.oa_id}
+
         # 4a. 全量同步：在职 + 离职都写入
         for login_name, (emp, is_employed) in all_map.items():
-            user = db.scalar(select(User).where(User.username == login_name))
+            user = users_by_username.get(login_name)
+            oa_id = str(emp.get("id")) if emp.get("id") else None
+
+            # 本地账号命名空间优先。OA 同名人员不得接管本地密码、管理员权限或禁用状态。
+            if user is not None and user.auth_source != AUTH_SOURCE_OA and not user.oa_id:
+                conflict_usernames.append(login_name)
+                logger.warning("OA 同步冲突：用户名 %s 已属于本地账号，已跳过且未覆盖", login_name)
+                continue
+            oa_owner = users_by_oa_id.get(oa_id) if oa_id else None
+            if oa_owner is not None and oa_owner.username != login_name:
+                conflict_usernames.append(login_name)
+                logger.warning(
+                    "OA 同步冲突：OA ID 已绑定其他用户名（incoming=%s, existing=%s），已跳过",
+                    login_name,
+                    oa_owner.username,
+                )
+                continue
+
             if user is None:
                 # 新人员：自动创建账号，新用户默认启用
                 user = User(
                     username=login_name,
-                    password_hash=hash_password(str(time.time())),
+                    # OA 账号仅通过 SSO 登录，不创建任何可用的本地密码。
+                    password_hash=None,
+                    auth_source=AUTH_SOURCE_OA,
                     display_name=emp.get("name") or login_name,
                     email=emp.get("email") or None,
                     phone=emp.get("phone") or None,
                     department=emp.get("department") or None,
-                    oa_id=str(emp.get("id")) if emp.get("id") else None,
+                    oa_id=oa_id,
                     partner_id=str(emp.get("qyPartner")) if emp.get("qyPartner") else None,
                     partner_name=emp.get("qyPartnerName") or None,
                     oa_employed=is_employed,
                     is_active=is_employed,
                 )
                 db.add(user)
+                users_by_username[login_name] = user
+                if oa_id:
+                    users_by_oa_id[oa_id] = user
                 created += 1
             else:
                 changed = False
+                if user.auth_source != AUTH_SOURCE_OA:
+                    user.auth_source = AUTH_SOURCE_OA
+                    changed = True
+                if user.password_hash is not None:
+                    user.password_hash = None
+                    changed = True
                 if emp.get("name") and user.display_name != emp["name"]:
                     user.display_name = emp["name"]
                     changed = True
@@ -135,9 +175,9 @@ def sync_users_from_oa() -> dict:
                 if emp.get("department") is not None and user.department != emp.get("department"):
                     user.department = emp.get("department") or None
                     changed = True
-                oa_id = str(emp.get("id")) if emp.get("id") else None
                 if oa_id and user.oa_id != oa_id:
                     user.oa_id = oa_id
+                    users_by_oa_id[oa_id] = user
                     changed = True
                 partner_name = emp.get("qyPartnerName") or None
                 if partner_name != user.partner_name:
@@ -167,6 +207,8 @@ def sync_users_from_oa() -> dict:
         "created": created,
         "updated": updated,
         "employed_changed": employed_changed,
+        "conflicts": len(conflict_usernames),
+        "conflict_usernames": sorted(set(conflict_usernames))[:100],
     }
     logger.info("OA 同步完成：%s", result)
     return result

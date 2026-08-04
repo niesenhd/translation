@@ -4,6 +4,7 @@ from __future__ import annotations
 from sqlalchemy import or_, select
 
 from app.core.database import SessionLocal
+from app.core.languages import language_pair_code
 from app.models.term import TermEntry
 
 # domain="法学" 的是 6.8 万条《英汉法律词典》原始导出（单字头词、词典式
@@ -11,20 +12,6 @@ from app.models.term import TermEntry
 # （如 court→议会、execute→履行、qualified→附条件的）。故词典退出翻译注入，
 # 仅作管理后台检索参考。参与注入的是带具体领域标签的精选术语（合同/诉讼/等）。
 _DICTIONARY_DOMAIN = "法学"
-
-
-def _normalize_lang(code: str) -> str:
-    """把语言代码归一化到短代码（zh / en / fr ...）。"""
-    lang_code_map = {
-        "zh": "zh", "zh-Hans": "zh", "zh-CN": "zh",
-        "zh-Hant": "zh", "zh-TW": "zh", "zh-HK": "zh",
-        "en": "en", "fr": "fr", "es": "es", "ru": "ru",
-        "ar": "ar", "ja": "ja", "ko": "ko", "de": "de",
-        "pt": "pt", "it": "it",
-    }
-    if not code:
-        return ""
-    return lang_code_map.get(code, code.split("-")[0])
 
 
 def _row(e: TermEntry, swap: bool = False) -> dict:
@@ -48,8 +35,8 @@ def get_glossary_for_lang_pair(source_lang: str, target_lang: str) -> list[dict]
        同时加载正向（src→tgt）与反向（tgt→src，source/target 互换）。
        因只作用于精选小集，不会重蹈"整本词典反向=垃圾"的覆辙。
     """
-    src = _normalize_lang(source_lang)
-    tgt = _normalize_lang(target_lang)
+    src = language_pair_code(source_lang)
+    tgt = language_pair_code(target_lang)
     not_dict = or_(TermEntry.domain.is_(None), TermEntry.domain != _DICTIONARY_DOMAIN)
 
     db = SessionLocal()

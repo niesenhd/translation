@@ -81,7 +81,24 @@
         </template>
       </el-table-column>
     </el-table>
+    <div class="pagination-row">
+      <el-pagination
+        v-model:current-page="page"
+        v-model:page-size="pageSize"
+        :page-sizes="[20, 50, 100]"
+        :total="total"
+        layout="total, sizes, prev, pager, next"
+        @current-change="fetchTasks"
+        @size-change="onPageSizeChange"
+      />
+    </div>
   </el-card>
+
+  <div v-if="downloadState.visible" class="download-panel">
+    <div class="download-title">正在下载 {{ downloadState.name }}</div>
+    <el-progress :percentage="downloadState.percent" :indeterminate="downloadState.indeterminate" />
+    <el-button size="small" @click="cancelDownload">取消下载</el-button>
+  </div>
 
   <el-dialog v-model="dialogVisible" title="新建翻译任务" :width="dialogWidth" @open="onDialogOpen">
     <el-form label-width="100px">
@@ -176,8 +193,12 @@ import { computed, nextTick, onMounted, onBeforeUnmount, reactive, ref } from 'v
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Warning } from '@element-plus/icons-vue'
 import api from '../api'
+import { confirmAndDeleteTask, taskPageParams } from '../task-actions'
 
 const tasks = ref([])
+const total = ref(0)
+const page = ref(1)
+const pageSize = ref(20)
 const loading = ref(false)
 const dialogVisible = ref(false)
 const submitting = ref(false)
@@ -185,6 +206,8 @@ const fileList = ref([])
 const selectedFiles = ref([])
 const selectedRows = ref([])
 const tableRef = ref(null)
+const downloadState = reactive({ visible: false, percent: 0, indeterminate: true, name: '' })
+let activeDownloadController = null
 const form = reactive({ target_lang: 'zh', output_mode: 'plain', pdf_output_format: 'pdf', translate_images: 'no', refine_mode: 'none', footnote_mode: 'bilingual' })
 
 // 反馈相关
@@ -199,7 +222,9 @@ const isPdf = computed(() => {
 // 对话框宽度自适应：小屏 90%，大屏固定 520px
 const winWidth = ref(window.innerWidth)
 const dialogWidth = computed(() => winWidth.value < 768 ? '90%' : '520px')
-window.addEventListener('resize', () => { winWidth.value = window.innerWidth })
+function handleResize() {
+  winWidth.value = window.innerWidth
+}
 
 let timer = null
 
@@ -208,12 +233,13 @@ async function fetchTasks() {
   const selectedIds = new Set(selectedRows.value.map(r => r.id))
   loading.value = true
   try {
-    const { data } = await api.get('/tasks')
-    tasks.value = data
+    const { data } = await api.get('/tasks', { params: taskPageParams(page.value, pageSize.value) })
+    tasks.value = data.items
+    total.value = data.total
     // 恢复选中状态
     if (selectedIds.size > 0) {
       await nextTick()
-      for (const row of data) {
+      for (const row of data.items) {
         if (selectedIds.has(row.id)) {
           tableRef.value?.toggleRowSelection(row, true)
         }
@@ -222,6 +248,11 @@ async function fetchTasks() {
   } finally {
     loading.value = false
   }
+}
+
+function onPageSizeChange() {
+  page.value = 1
+  fetchTasks()
 }
 
 function onFileChange(file) {
@@ -265,7 +296,7 @@ async function submit() {
       fd.append('translate_images', form.translate_images)
       fd.append('refine_mode', form.refine_mode)
       fd.append('footnote_mode', form.footnote_mode)
-      return api.post('/tasks/upload', fd)
+      return api.post('/tasks/upload', fd, { timeout: 10 * 60 * 1000 })
     })
   )
   const succeeded = results.filter(r => r.status === 'fulfilled').length
@@ -287,8 +318,48 @@ async function submit() {
   submitting.value = false
 }
 
+function beginDownload(name) {
+  activeDownloadController?.abort()
+  downloadState.visible = true
+  downloadState.percent = 0
+  downloadState.indeterminate = true
+  downloadState.name = name
+  activeDownloadController = new AbortController()
+  return activeDownloadController
+}
+
+function updateDownloadProgress(event) {
+  if (event.total) {
+    downloadState.indeterminate = false
+    downloadState.percent = Math.min(100, Math.round((event.loaded / event.total) * 100))
+  }
+}
+
+function finishDownload() {
+  downloadState.visible = false
+  activeDownloadController = null
+}
+
+function cancelDownload() {
+  activeDownloadController?.abort()
+  finishDownload()
+  ElMessage.info('已取消下载')
+}
+
 async function downloadFile(url, fallbackName) {
-  const resp = await api.get(url, { responseType: 'blob' })
+  const controller = beginDownload(fallbackName)
+  let resp
+  try {
+    resp = await api.get(url, {
+      responseType: 'blob',
+      signal: controller.signal,
+      onDownloadProgress: updateDownloadProgress,
+    })
+  } catch (error) {
+    if (error.code !== 'ERR_CANCELED') ElMessage.error(error.response?.data?.detail || '下载失败')
+    finishDownload()
+    return
+  }
   const blob = resp.data
   const blobUrl = URL.createObjectURL(blob)
   const a = document.createElement('a')
@@ -306,6 +377,7 @@ async function downloadFile(url, fallbackName) {
   a.download = name
   a.click()
   URL.revokeObjectURL(blobUrl)
+  finishDownload()
 }
 
 function downloadResult(row) {
@@ -327,17 +399,33 @@ async function retry(row) {
 }
 
 async function del(row) {
-  await api.delete(`/tasks/${row.id}`)
-  ElMessage.success('已删除')
-  fetchTasks()
+  try {
+    await confirmAndDeleteTask(
+      row,
+      (task) => ElMessageBox.confirm(`确定删除“${task.original_filename}”？`, '删除任务', { type: 'warning' }),
+      (task) => api.delete(`/tasks/${task.id}`),
+    )
+    ElMessage.success('已删除')
+    if (tasks.value.length === 1 && page.value > 1) page.value -= 1
+    fetchTasks()
+  } catch (error) {
+    if (error !== 'cancel' && error !== 'close') {
+      ElMessage.error(error.response?.data?.detail || '删除失败')
+    }
+  }
 }
 
 // 批量操作
 async function batchDownloadPost(url, fallbackName) {
   const ids = selectedRows.value.map(r => r.id)
   if (!ids.length) return
+  const controller = beginDownload(fallbackName)
   try {
-    const resp = await api.post(url, ids, { responseType: 'blob' })
+    const resp = await api.post(url, ids, {
+      responseType: 'blob',
+      signal: controller.signal,
+      onDownloadProgress: updateDownloadProgress,
+    })
     const blob = resp.data
     const blobUrl = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -354,8 +442,10 @@ async function batchDownloadPost(url, fallbackName) {
     a.download = name
     a.click()
     URL.revokeObjectURL(blobUrl)
+    finishDownload()
   } catch (e) {
-    ElMessage.error('批量下载失败')
+    if (e.code !== 'ERR_CANCELED') ElMessage.error('批量下载失败')
+    finishDownload()
   }
 }
 
@@ -378,6 +468,7 @@ async function batchDelete() {
   try {
     await api.post('/tasks/batch/delete', ids)
     ElMessage.success('已删除')
+    if (ids.length >= tasks.value.length && page.value > 1) page.value -= 1
     clearSelection()
     fetchTasks()
   } catch (e) {
@@ -386,10 +477,10 @@ async function batchDelete() {
 }
 
 function statusType(s) {
-  return { queued: 'info', running: 'warning', succeeded: 'success', failed: 'danger' }[s] || ''
+  return { uploading: 'info', queued: 'info', running: 'warning', succeeded: 'success', failed: 'danger' }[s] || ''
 }
 function statusText(s) {
-  return { queued: '排队中', running: '翻译中', succeeded: '完成', failed: '失败' }[s] || s
+  return { uploading: '上传中', queued: '排队中', running: '翻译中', succeeded: '完成', failed: '失败' }[s] || s
 }
 function formatTime(t) {
   return new Date(t).toLocaleString('zh-CN')
@@ -430,7 +521,7 @@ async function submitFeedback() {
 }
 
 // 动态轮询：有活跃任务时 3s，无活跃任务时 15s，减少不必要的数据库和网络开销
-const ACTIVE_STATUSES = ['queued', 'running']
+const ACTIVE_STATUSES = ['uploading', 'queued', 'running']
 let currentInterval = 3000
 
 const smartPoll = () => {
@@ -448,10 +539,15 @@ const smartPoll = () => {
 }
 
 onMounted(() => {
+  window.addEventListener('resize', handleResize)
   fetchTasks()
   timer = setInterval(smartPoll, currentInterval)
 })
-onBeforeUnmount(() => clearInterval(timer))
+onBeforeUnmount(() => {
+  clearInterval(timer)
+  window.removeEventListener('resize', handleResize)
+  activeDownloadController?.abort()
+})
 </script>
 
 <style scoped>
@@ -468,5 +564,30 @@ onBeforeUnmount(() => clearInterval(timer))
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.pagination-row {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
+.download-panel {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  z-index: 3000;
+  width: min(360px, calc(100vw - 48px));
+  padding: 16px;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 4px 18px rgb(0 0 0 / 18%);
+}
+
+.download-title {
+  margin-bottom: 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 </style>

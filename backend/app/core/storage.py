@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Iterator
 from io import BytesIO
 from typing import BinaryIO
 
@@ -67,6 +68,27 @@ def download_bytes(object_name: str) -> bytes:
     finally:
         response.close()
         response.release_conn()
+
+
+def download_stream(object_name: str, chunk_size: int = 1024 * 1024) -> Iterator[bytes]:
+    """按块读取对象，并在响应结束或客户端中断时释放 MinIO 连接。"""
+    client = get_client()
+    response = client.get_object(_settings.minio_bucket, object_name)
+    try:
+        while True:
+            chunk = response.read(chunk_size)
+            if not chunk:
+                break
+            yield chunk
+    finally:
+        response.close()
+        response.release_conn()
+
+
+def object_size(object_name: str) -> int:
+    """返回对象大小，用于流式响应的 Content-Length。"""
+    stat = get_client().stat_object(_settings.minio_bucket, object_name)
+    return int(stat.size or 0)
 
 
 def remove_object(object_name: str) -> None:

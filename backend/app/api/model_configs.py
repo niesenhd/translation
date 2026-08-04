@@ -6,7 +6,9 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 
+from app.core.crypto import encrypt_secret
 from app.core.database import SessionLocal
 from app.core.security import CurrentUser, require_admin
 from app.models.model_config import ModelConfig, ModelType
@@ -89,12 +91,16 @@ def create_model(payload: ModelConfigCreate, user: CurrentUser = Depends(require
             model_type=payload.model_type,
             model_id=payload.model_id,
             api_base_url=payload.api_base_url,
-            api_key=payload.api_key,
+            api_key=encrypt_secret(payload.api_key),
             is_active=payload.is_active,
             updated_by=user.username,
         )
         db.add(entry)
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="同一模型类型只能激活一个配置") from exc
         db.refresh(entry)
 
         # 如果激活了模型，重置翻译器
@@ -127,6 +133,8 @@ def update_model(model_id: str, payload: ModelConfigUpdate, user: CurrentUser = 
         was_active = entry.is_active
 
         for field, value in payload.model_dump(exclude_unset=True).items():
+            if field == "api_key":
+                value = encrypt_secret(value)
             setattr(entry, field, value)
         entry.updated_by = user.username
 
@@ -142,7 +150,11 @@ def update_model(model_id: str, payload: ModelConfigUpdate, user: CurrentUser = 
                 .values(is_active=False)
             )
 
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="同一模型类型只能激活一个配置") from exc
         db.refresh(entry)
 
         # 如果激活状态变化，重置翻译器
@@ -230,22 +242,20 @@ def _reset_translators():
 
 
 def get_active_translation_config() -> ModelConfig | None:
-    """获取当前激活的翻译模型配置。"""
+    """兼容旧调用；新代码应使用 services.model_config_service。"""
     db = SessionLocal()
     try:
-        return db.scalar(
-            select(ModelConfig).where(ModelConfig.model_type == ModelType.TRANSLATION, ModelConfig.is_active == True)
-        )
+        return db.scalar(select(ModelConfig).where(ModelConfig.model_type == ModelType.TRANSLATION, ModelConfig.is_active.is_(True)))
     finally:
         db.close()
 
 
 def get_active_vl_config() -> ModelConfig | None:
-    """获取当前激活的 VL 模型配置。"""
+    """兼容旧调用；新代码应使用 services.model_config_service。"""
     db = SessionLocal()
     try:
         return db.scalar(
-            select(ModelConfig).where(ModelConfig.model_type == ModelType.VL, ModelConfig.is_active == True)
+            select(ModelConfig).where(ModelConfig.model_type == ModelType.VL, ModelConfig.is_active.is_(True))
         )
     finally:
         db.close()

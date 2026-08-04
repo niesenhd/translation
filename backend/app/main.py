@@ -14,15 +14,8 @@ from app.api.tm import router as tm_router
 from app.api.feedback import router as feedback_router
 from app.api.model_configs import router as model_configs_router
 from app.api.sso import router as sso_router
-from app.core.database import Base, SessionLocal, engine, get_db
-# 显式 import 让 Base.metadata 包含所有 model 表
-from app.models import system_config as _system_config  # noqa: F401
-from app.models import task as _task  # noqa: F401
-from app.models import term as _term  # noqa: F401
-from app.models import translation_memory as _translation_memory  # noqa: F401
-from app.models import feedback as _feedback  # noqa: F401
-from app.models import model_config as _model_config  # noqa: F401
-from app.models import user as _user  # noqa: F401
+from app.core.config import get_settings
+from app.core.database import get_db
 
 # 统一日志配置：所有模块共享同一格式和级别
 logging.basicConfig(
@@ -36,59 +29,12 @@ logging.getLogger("openai").setLevel(logging.WARNING)
 logging.getLogger("celery").setLevel(logging.INFO)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
-# P0 阶段：直接 create_all；后续接入 Alembic 迁移
-Base.metadata.create_all(bind=engine)
-
-
-def _ensure_columns() -> None:
-    """对已存在的表做幂等的列补齐（Alembic 上线前的过渡方案）。
-
-    create_all 不会在已有表上加新列，必须手动 ALTER。
-    """
-    statements = [
-        # 2026-06-13: 新增 pdf_output_format（PDF 输出格式选择）
-        "ALTER TABLE translation_tasks "
-        "ADD COLUMN IF NOT EXISTS pdf_output_format VARCHAR(8) NOT NULL DEFAULT 'pdf'",
-        # 2026-06-14: 新增 translate_images（是否翻译图片中的文字）
-        # 默认 'no'：与需求 2.2 默认项「仅翻译文档文字」及模型 server_default 一致
-        "ALTER TABLE translation_tasks "
-        "ADD COLUMN IF NOT EXISTS translate_images VARCHAR(8) NOT NULL DEFAULT 'no'",
-        # 2026-07-09: 新增 refine_mode（两遍法精译模式，功能C），默认 none
-        "ALTER TABLE translation_tasks "
-        "ADD COLUMN IF NOT EXISTS refine_mode VARCHAR(16) NOT NULL DEFAULT 'none'",
-        # 2026-07-09: TM 增 task_id（来源任务追溯，功能1）
-        "ALTER TABLE translation_memories "
-        "ADD COLUMN IF NOT EXISTS task_id VARCHAR(36)",
-        # 2026-07-09: 新增 footnote_mode（脚注处理，仅双语模式生效），默认 bilingual
-        "ALTER TABLE translation_tasks "
-        "ADD COLUMN IF NOT EXISTS footnote_mode VARCHAR(20) NOT NULL DEFAULT 'bilingual'",
-        # 2026-07-22: User 表新增 OA 同步字段
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(256)",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(32)",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS department VARCHAR(128)",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS oa_id VARCHAR(64)",
-        # 2026-08-03: User 表新增主管合伙人字段
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS partner_id VARCHAR(64)",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS partner_name VARCHAR(128)",
-        # 2026-08-03: User 表新增 OA 在职状态字段（独立于 is_active）
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS oa_employed BOOLEAN NOT NULL DEFAULT true",
-    ]
-    with SessionLocal() as session:
-        for sql in statements:
-            try:
-                session.execute(text(sql))
-                session.commit()
-            except Exception:
-                session.rollback()
-
-
-_ensure_columns()
-
-app = FastAPI(title="法律文档翻译系统", version="0.1.0")
+app = FastAPI(title="文档翻译系统", version="0.1.0")
+settings = get_settings()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origin_list,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -2,16 +2,17 @@
 from __future__ import annotations
 
 import io
-import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
+from sqlalchemy.exc import IntegrityError
 
 from app.core.database import SessionLocal
 from app.core.security import CurrentUser, require_admin
 from app.models.translation_memory import TranslationMemory
 from app.models.task import TaskStatus, TranslationTask
+from app.services.terminology_repository import upsert_translation_memory as _upsert_tm_record
 
 router = APIRouter(prefix="/admin/tm", tags=["translation-memory"], dependencies=[Depends(require_admin)])
 
@@ -71,31 +72,17 @@ def _to_read(t: TranslationMemory) -> TMRead:
 def _upsert_tm(db, source_text: str, target_text: str, lang_pair: str,
                source: str, domain: str | None, task_id: str | None,
                username: str) -> bool:
-    """去重写入：同 lang_pair + 归一化 source_text 已存在则更新 target，否则新增。返回是否写入。"""
-    norm = source_text.strip().lower()
-    existing = db.scalar(
-        select(TranslationMemory).where(
-            TranslationMemory.lang_pair == lang_pair,
-            func.lower(func.btrim(TranslationMemory.source_text)) == norm,
-        )
-    )
-    if existing:
-        if existing.target_text != target_text:
-            existing.target_text = target_text
-            existing.updated_by = username
-            if task_id:
-                existing.task_id = task_id
-        return True
-    db.add(TranslationMemory(
-        id=str(uuid.uuid4()),
+    """使用唯一约束原子 UPSERT，避免并发 check-then-act 产生重复记录。"""
+    _upsert_tm_record(
+        db,
         source_text=source_text,
         target_text=target_text,
         lang_pair=lang_pair,
         source=source,
         domain=domain,
         task_id=task_id,
-        updated_by=username,
-    ))
+        username=username,
+    )
     return True
 
 
@@ -159,7 +146,7 @@ def create_tm(payload: TMCreate, user: CurrentUser = Depends(require_admin)):
         entry = db.scalar(
             select(TranslationMemory).where(
                 TranslationMemory.lang_pair == payload.lang_pair,
-                func.lower(func.btrim(TranslationMemory.source_text)) == norm,
+                TranslationMemory.source_normalized == norm,
             )
         )
         return _to_read(entry)
@@ -252,7 +239,14 @@ def update_tm(tm_id: str, payload: TMUpdate, user: CurrentUser = Depends(require
         for field, value in payload.model_dump(exclude_unset=True).items():
             setattr(entry, field, value)
         entry.updated_by = user.username
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="同一语种方向下已存在相同的归一化源文本",
+            ) from exc
         db.refresh(entry)
         return TMRead(
             id=entry.id,

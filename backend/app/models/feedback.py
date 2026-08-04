@@ -3,12 +3,12 @@ from __future__ import annotations
 
 import enum
 import uuid
-from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, Integer, String, Text
+from sqlalchemy import CheckConstraint, Enum, ForeignKey, Integer, String, Text, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
+from app.models.base import TimestampMixin
 
 
 class FeedbackStatus(str, enum.Enum):
@@ -25,15 +25,25 @@ class FeedbackType(str, enum.Enum):
     OTHER = "other"              # 其他
 
 
-class QualityFeedback(Base):
+class QualityFeedback(TimestampMixin, Base):
     __tablename__ = "quality_feedbacks"
+    __table_args__ = (
+        CheckConstraint("rating IS NULL OR (rating >= 1 AND rating <= 5)", name="ck_feedback_rating"),
+    )
 
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    id: Mapped[str] = mapped_column(Uuid(as_uuid=False), primary_key=True, default=lambda: str(uuid.uuid4()))
 
     # 关联的翻译任务
-    task_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    task_id: Mapped[str] = mapped_column(
+        Uuid(as_uuid=False),
+        ForeignKey("translation_tasks.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
     # 提交用户
-    username: Mapped[str] = mapped_column(String(128), nullable=False)
+    username: Mapped[str] = mapped_column(
+        String(128), ForeignKey("users.username", ondelete="RESTRICT"), nullable=False
+    )
     # 评分 1-5
     rating: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # 问题类型
@@ -53,6 +63,3 @@ class QualityFeedback(Base):
     reject_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     # 审核人
     reviewed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
-
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

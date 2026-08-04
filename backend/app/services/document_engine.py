@@ -536,21 +536,6 @@ def _write_text_to_xml_paragraph(p_elem, new_text: str) -> None:
                 r.remove(node)
 
 
-def _run_has_drawing(run) -> bool:
-    """判断 run 内是否含图片 / 嵌入对象 / 公式等非文本元素。
-
-    python-docx 的 `run.text = value` 会清空 run 的所有子元素（包括 w:drawing），
-    因此对含图片的 run 必须跳过，避免图片丢失。
-    """
-    el = run._element
-    # 命名空间前缀已在 docx 内置注册，xpath 直接用即可
-    return bool(
-        el.xpath(".//w:drawing")
-        or el.xpath(".//w:pict")
-        or el.xpath(".//w:object")
-    )
-
-
 # run 内出现下列元素之一即"不可覆盖"：
 # - 图片 / 嵌入对象 / 公式：drawing / pict / object
 # - 脚注 / 尾注引用标记：footnoteReference / endnoteReference（正文里指向脚注的
@@ -653,8 +638,9 @@ def _translate_docx_inplace(doc: Document, translator: Translator, ctx: Translat
 def _replace_docx_images(doc: Document, ctx: TranslationContext) -> None:
     """P1.3：对 docx 中的内嵌图片执行 OCR + 就地替换文字。
 
-    遍历文档中所有图片，调用 process_image_ocr 擦除原文并写入译文，
-    然后将修改后的图片替换回文档。
+    遍历整个 OPC 包的图片关系（正文、表格、页眉页脚、脚注等），调用
+    process_image_ocr 擦除原文并写入译文，然后将修改后的图片替换回文档。
+    同一个图片 part 可能被多个 relationship 复用，只处理一次。
 
     如果 ctx.translate_images == "no"，跳过图片 OCR，保持原样。
     """
@@ -662,52 +648,43 @@ def _replace_docx_images(doc: Document, ctx: TranslationContext) -> None:
         logger.info("用户选择不翻译图片文字，跳过 DOCX 图片 OCR")
         return
 
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+
     from app.services.ocr import process_image_ocr
 
-    # 收集所有需要处理的图片关系 ID 和对应的图片数据
-    ns = {
-        "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
-        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
-        "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
-    }
-
     replaced_count = 0
-    processed_rIds: set[str] = set()
-    for paragraph in doc.paragraphs:
-        for run in paragraph.runs:
-            if not _run_has_drawing(run):
+    processed_parts: set = set()
+    for rel in doc.part.package.iter_rels():
+        if rel.is_external or rel.reltype != RT.IMAGE:
+            continue
+        image_part = rel.target_part
+        if image_part in processed_parts:
+            continue
+        processed_parts.add(image_part)
+        try:
+            image_bytes = image_part.blob
+            mime = getattr(image_part, "content_type", "image/png") or "image/png"
+            partname = str(getattr(image_part, "partname", "unknown"))
+
+            logger.info("DOCX 图片 OCR 处理: part=%s, size=%d bytes, mime=%s",
+                        partname, len(image_bytes), mime)
+
+            # 就地替换图片中的文字（透传术语库 / TM / 源语种）
+            new_image_bytes = process_image_ocr(
+                image_bytes, ctx.target_lang, mime,
+                source_lang=ctx.source_lang,
+                glossary=ctx.glossary,
+                tm_lookup=ctx.tm_lookup,
+            )
+            if new_image_bytes == image_bytes:
+                logger.info("DOCX 图片 OCR 无变化，跳过替换")
                 continue
-            el = run._element
-            for blip in el.findall(".//a:blip", ns):
-                rId = blip.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed")
-                if not rId or rId in processed_rIds:
-                    continue
-                processed_rIds.add(rId)
-                try:
-                    image_part = doc.part.related_parts[rId]
-                    image_bytes = image_part.blob
-                    mime = getattr(image_part, "content_type", "image/png") or "image/png"
 
-                    logger.info("DOCX 图片 OCR 处理: rId=%s, size=%d bytes, mime=%s",
-                                rId, len(image_bytes), mime)
-
-                    # 就地替换图片中的文字（透传术语库 / TM / 源语种）
-                    new_image_bytes = process_image_ocr(
-                        image_bytes, ctx.target_lang, mime,
-                        source_lang=ctx.source_lang,
-                        glossary=ctx.glossary,
-                        tm_lookup=ctx.tm_lookup,
-                    )
-                    if new_image_bytes == image_bytes:
-                        logger.info("DOCX 图片 OCR 无变化，跳过替换")
-                        continue
-
-                    # 替换图片数据
-                    image_part._blob = new_image_bytes
-                    replaced_count += 1
-                    logger.info("DOCX 图片 OCR 替换成功: rId=%s", rId)
-                except (KeyError, AttributeError) as exc:
-                    logger.warning("替换 docx 图片失败：%s", exc)
+            image_part._blob = new_image_bytes
+            replaced_count += 1
+            logger.info("DOCX 图片 OCR 替换成功: part=%s", partname)
+        except (KeyError, AttributeError) as exc:
+            logger.warning("替换 docx 图片失败：%s", exc)
 
     if replaced_count > 0:
         logger.info("DOCX 共替换 %d 张图片", replaced_count)
@@ -852,33 +829,9 @@ def translate_pdf_to_docx(data: bytes, translator: Translator, ctx: TranslationC
 
 
 def _should_skip_pdf_text(text: str) -> bool:
-    """判断 PDF 中的文本是否不需要翻译（纯数字、公式、日期等）。"""
-    import re as _re
-    text = text.strip()
-    if not text:
-        return True
-    # 纯数字（含小数、百分号、货币符号）
-    if _re.match(r'^[\d\s,.%$€¥£₹+\-]+$', text):
-        return True
-    # 日期格式
-    if _re.match(r'^\d{4}[-/]\d{1,2}[-/]\d{1,2}$', text):
-        return True
-    # 时间格式
-    if _re.match(r'^\d{1,2}:\d{2}(:\d{2})?$', text):
-        return True
-    # 邮箱
-    if _re.match(r'^[\w.+-]+@[\w-]+\.[\w.]+$', text):
-        return True
-    # URL
-    if _re.match(r'^https?://', text):
-        return True
-    # 版本号
-    if _re.match(r'^v?\d+\.\d+', text, _re.IGNORECASE):
-        return True
-    # 单个标点/符号
-    if len(text) <= 2 and not _re.search(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]', text):
-        return True
-    return False
+    from app.services.text_rules import should_skip_translation
+
+    return should_skip_translation(text, short_symbols=True)
 
 
 def _is_scanned_pdf(doc) -> bool:
@@ -1031,59 +984,6 @@ def _replace_pdf_images(doc, ctx: TranslationContext) -> None:
         logger.info("PDF 共替换 %d 张图片", replaced_count)
 
 
-def _sample_pdf_bg_color(page, rect) -> tuple[float, float, float]:
-    """采样 PDF 页面中指定区域周围的背景色，返回归一化 RGB (0~1)。
-
-    用于 redact 擦除时填充背景色，避免有色底/表格底纹页面留下白块。
-    采样策略：取 bbox 四周一圈像素的均值作为背景色。
-    失败时回退到白色 (1, 1, 1)。
-    """
-    import fitz  # noqa: F811
-
-    try:
-        # 向外扩展 2px 采样背景，但不超过页面边界
-        page_rect = page.rect
-        clip = fitz.Rect(
-            max(page_rect.x0, rect.x0 - 2),
-            max(page_rect.y0, rect.y0 - 2),
-            min(page_rect.x1, rect.x1 + 2),
-            min(page_rect.y1, rect.y1 + 2),
-        )
-        if clip.width <= 0 or clip.height <= 0:
-            return (1, 1, 1)
-
-        pix = page.get_pixmap(clip=clip)
-        samples = pix.samples
-        n = pix.n  # 通道数（RGB=3, RGBA=4, 灰度=1）
-
-        # 取四角各 1 个像素的均值作为背景色
-        w = pix.width
-        h = pix.height
-        corner_indices = [0, (w - 1) * n, (h - 1) * w * n, ((h - 1) * w + (w - 1)) * n]
-        r_sum = g_sum = b_sum = 0
-        count = 0
-        for idx in corner_indices:
-            if idx + n - 1 >= len(samples):
-                continue
-            if n >= 3:
-                r_sum += samples[idx]
-                g_sum += samples[idx + 1]
-                b_sum += samples[idx + 2]
-            else:
-                # 灰度图：RGB 三通道相同
-                r_sum += samples[idx]
-                g_sum += samples[idx]
-                b_sum += samples[idx]
-            count += 1
-
-        if count == 0:
-            return (1, 1, 1)
-
-        return (r_sum / (count * 255), g_sum / (count * 255), b_sum / (count * 255))
-    except Exception:  # noqa: BLE001
-        return (1, 1, 1)
-
-
 # 阿语等脚本 PyMuPDF 内置字体（china-s 等）无阿拉伯字形，尝试从系统 Noto 字体加载。
 # 服务器需安装 fonts-noto（apt install fonts-noto-core / fonts-noto）方可正常渲染阿语 PDF；
 # 找不到则回退 china-s（不会崩，仅阿语可能显示方块，与旧行为一致）。
@@ -1189,11 +1089,6 @@ def translate_pdf_inplace(data: bytes, translator: Translator, ctx: TranslationC
         # 2. 批量翻译
         translated = _translate_many(texts, translator, ctx)
 
-        # 2.5 为每个 span 采样背景色（避免有色底/表格底纹页面留白块）
-        # 采样策略：取 span bbox 稍微向外扩展一圈，取该区域的四角像素均值作为背景色
-        for span_info in spans_info:
-            span_info["bg_color"] = _sample_pdf_bg_color(doc[span_info["page_idx"]], span_info["rect"])
-
         # 3. 逐 span 擦除原文并写入译文
         for span_info, new_text in zip(spans_info, translated):
             if not new_text or new_text == span_info["text"]:
@@ -1202,12 +1097,16 @@ def translate_pdf_inplace(data: bytes, translator: Translator, ctx: TranslationC
             page = doc[span_info["page_idx"]]
             rect = span_info["rect"]
 
-            # 擦除原文（用采样到的背景色填充，避免有色底页面留白块）
-            page.add_redact_annot(rect, fill=span_info["bg_color"])
+            # 透明擦除：只删除文字对象，不用矩形颜色覆盖原背景。
+            page.add_redact_annot(rect, fill=False, cross_out=False)
 
-        # 一次性提交所有擦除
+        # 一次性提交所有擦除；明确保留与文字 bbox 相交的图片和矢量图形。
         for page in doc:
-            page.apply_redactions()
+            page.apply_redactions(
+                images=fitz.PDF_REDACT_IMAGE_NONE,
+                graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+                text=fitz.PDF_REDACT_TEXT_REMOVE,
+            )
 
         # 4. 写回译文
         is_rtl = ctx.target_lang.lower() in ("ar", "ara", "arabic")
@@ -1270,11 +1169,22 @@ def translate_pdf_inplace(data: bytes, translator: Translator, ctx: TranslationC
 def _libreoffice_convert(data: bytes, source_ext: str, target_ext: str) -> bytes:
     """使用 LibreOffice headless 将老格式文件转换为新格式。
 
-    支持：.doc → .docx, .ppt → .pptx
+    支持：.doc → .docx, .ppt → .pptx, .xls → .xlsx
     要求：容器内已安装 libreoffice（通过 Dockerfile 安装）。
     """
+    source_ext = source_ext.lower().lstrip(".")
+    target_ext = target_ext.lower().lstrip(".")
+    if (source_ext, target_ext) not in {
+        ("doc", "docx"), ("ppt", "pptx"), ("xls", "xlsx"),
+    }:
+        raise ValueError(f"不允许的 LibreOffice 转换：.{source_ext} → .{target_ext}")
+
     with tempfile.TemporaryDirectory() as tmp:
+        from pathlib import Path
+
         input_path = os.path.join(tmp, f"input.{source_ext}")
+        profile_path = os.path.join(tmp, "lo-profile")
+        os.makedirs(profile_path, exist_ok=True)
         with open(input_path, "wb") as f:
             f.write(data)
 
@@ -1283,6 +1193,12 @@ def _libreoffice_convert(data: bytes, source_ext: str, target_ext: str) -> bytes
             [
                 "libreoffice",
                 "--headless",
+                "--nologo",
+                "--nodefault",
+                "--nolockcheck",
+                "--norestore",
+                "--safe-mode",
+                f"-env:UserInstallation={Path(profile_path).as_uri()}",
                 "--convert-to", target_ext,
                 "--outdir", tmp,
                 input_path,
@@ -1290,6 +1206,8 @@ def _libreoffice_convert(data: bytes, source_ext: str, target_ext: str) -> bytes
             capture_output=True,
             text=True,
             timeout=120,
+            cwd=tmp,
+            stdin=subprocess.DEVNULL,
         )
         if result.returncode != 0:
             raise RuntimeError(
@@ -1411,55 +1329,14 @@ def translate_csv(data: bytes, translator: Translator, ctx: TranslationContext) 
 def translate_xls(data: bytes, translator: Translator, ctx: TranslationContext) -> bytes:
     """老版 Excel (.xls) 翻译。
 
-    实现路径：xlrd 读取 .xls → 数据/公式转入 openpyxl Workbook → 走 xlsx 翻译路径。
-    输出格式：.xlsx（业界通行；老 .xls 缺乏现代格式特性，无意义保留）
+    实现路径：隔离的 LibreOffice headless 进程将 .xls 转为 .xlsx，
+    再走 xlsx 翻译路径。输出格式为 .xlsx。
 
     限制：
-    - .xls 不保留：图表、数据透视、宏（与 .xls 转 .xlsx 通用限制一致）
-    - 单元格格式（字体/边框/对齐）做尽力保留；样式可能与原版略有差异
+    - LibreOffice 转换可能无法完整保留宏和少数专有 Excel 特性
     """
-    import xlrd
-    from openpyxl import Workbook
-
-    book = xlrd.open_workbook(file_contents=data, formatting_info=False)
-    wb = Workbook()
-    # 删除 openpyxl 默认创建的空白 sheet
-    default_ws = wb.active
-    wb.remove(default_ws)
-
-    for sheet in book.sheets():
-        new_ws = wb.create_sheet(title=(sheet.name or "Sheet")[:31])
-        for r in range(sheet.nrows):
-            for c in range(sheet.ncols):
-                cell = sheet.cell(r, c)
-                value = cell.value
-                # xlrd ctype: 0=empty 1=text 2=number 3=date 4=bool 5=error 6=blank
-                if cell.ctype == xlrd.XL_CELL_EMPTY or cell.ctype == xlrd.XL_CELL_BLANK:
-                    continue
-                if cell.ctype == xlrd.XL_CELL_DATE:
-                    try:
-                        from datetime import datetime
-                        value = xlrd.xldate.xldate_as_datetime(value, book.datemode)
-                    except Exception:  # noqa: BLE001
-                        pass
-                elif cell.ctype == xlrd.XL_CELL_BOOLEAN:
-                    value = bool(value)
-                elif cell.ctype == xlrd.XL_CELL_NUMBER:
-                    # 整数显示为 int，避免 1.0 -> 1
-                    if value == int(value):
-                        value = int(value)
-                new_ws.cell(row=r + 1, column=c + 1, value=value)
-
-        # 合并单元格还原
-        for crange in sheet.merged_cells:
-            r1, r2, c1, c2 = crange  # xlrd: [r1, r2) [c1, c2) 半开区间
-            new_ws.merge_cells(start_row=r1 + 1, start_column=c1 + 1,
-                               end_row=r2, end_column=c2)
-
-    # 转成 xlsx 字节，复用 xlsx 翻译路径
-    intermediate = io.BytesIO()
-    wb.save(intermediate)
-    return translate_xlsx(intermediate.getvalue(), translator, ctx)
+    xlsx_data = _libreoffice_convert(data, "xls", "xlsx")
+    return translate_xlsx(xlsx_data, translator, ctx)
 
 
 def _replace_pptx_images(prs, ctx: TranslationContext) -> None:
@@ -1801,7 +1678,9 @@ def translate_xlsx(data: bytes, translator: Translator, ctx: TranslationContext)
 
     from openpyxl import load_workbook
     from openpyxl.cell.cell import TYPE_FORMULA
-    from openpyxl.utils.cell import column_index_from_string
+    from openpyxl.formula import Tokenizer
+    from openpyxl.formula.tokenizer import Token
+    from openpyxl.utils.cell import range_boundaries, range_to_tuple
 
     wb = load_workbook(io.BytesIO(data))
 
@@ -1816,22 +1695,30 @@ def translate_xlsx(data: bytes, translator: Translator, ctx: TranslationContext)
     # 表名 -> sheet_idx 映射，用于解析跨表引用
     sheet_name_to_idx: dict[str, int] = {}
     for idx, ws in enumerate(wb.worksheets):
-        sheet_name_to_idx[ws.title] = idx
-
-    # 匹配单元格/范围引用，支持跨表：[SheetName!]A1[:B2]
-    # 组：sheet_name(可选) / col_a / row_a / col_b(可选) / row_b(可选)
-    _REF_RE = re.compile(
-        r"(?<![A-Za-z0-9_$:!])"
-        r"(?:'([^']+)'!|([A-Za-z0-9_]+)!)?"
-        r"([A-Z]{1,3})(\$?\d+)"
-        r"(?::([A-Z]{1,3})(\$?\d+))?"
-    )
+        sheet_name_to_idx[ws.title.casefold()] = idx
 
     def _resolve_sheet_idx(current_idx: int, sheet_name: str | None) -> int | None:
         """把公式里的 sheet 引用名解析为 sheet_idx。"""
         if not sheet_name:
             return current_idx
-        return sheet_name_to_idx.get(sheet_name)
+        return sheet_name_to_idx.get(sheet_name.casefold())
+
+    def _parse_formula_range(current_idx: int, value: str) -> tuple[int, int, int, int, int] | None:
+        """解析 Tokenizer 已确认的 RANGE token；命名范围等非坐标 token 返回 None。"""
+        try:
+            if "!" in value:
+                sheet_name, bounds = range_to_tuple(value)
+                # Excel 在单引号表名中用两个单引号表示一个单引号。
+                target_sheet_idx = _resolve_sheet_idx(current_idx, sheet_name.replace("''", "'"))
+            else:
+                bounds = range_boundaries(value)
+                target_sheet_idx = current_idx
+            if target_sheet_idx is None or any(v is None for v in bounds):
+                return None
+            c1, r1, c2, r2 = bounds
+            return target_sheet_idx, min(r1, r2), min(c1, c2), max(r1, r2), max(c1, c2)
+        except (TypeError, ValueError):
+            return None
 
     for sheet_idx, ws in enumerate(wb.worksheets):
         for row in ws.iter_rows():
@@ -1841,28 +1728,23 @@ def translate_xlsx(data: bytes, translator: Translator, ctx: TranslationContext)
                 formula_str = cell.value if isinstance(cell.value, str) else None
                 if not formula_str:
                     continue
-                # 字符串字面量
-                for lit in re.findall(r'"([^"]*)"', formula_str):
-                    if lit:
-                        formula_literals_to_skip.add(lit)
-                # 单元格 / 范围引用（含跨表 Sheet!A1:B2）
-                for ref_match in re.finditer(_REF_RE, formula_str):
-                    sheet_quoted, sheet_plain, col_a, row_a, col_b, row_b = ref_match.groups()
-                    sheet_name = sheet_quoted or sheet_plain
-                    target_sheet_idx = _resolve_sheet_idx(sheet_idx, sheet_name)
-                    if target_sheet_idx is None:
+                try:
+                    tokens = Tokenizer(formula_str).items
+                except Exception:  # noqa: BLE001
+                    continue
+                for token in tokens:
+                    if token.type != Token.OPERAND:
                         continue
-                    try:
-                        c1 = column_index_from_string(col_a)
-                        r1 = int(row_a.lstrip("$"))
-                        if col_b and row_b:
-                            c2 = column_index_from_string(col_b)
-                            r2 = int(row_b.lstrip("$"))
-                        else:
-                            c2, r2 = c1, r1
-                        formula_ranges.append((target_sheet_idx, min(r1, r2), min(c1, c2), max(r1, r2), max(c1, c2)))
-                    except Exception:  # noqa: BLE001
-                        continue
+                    if token.subtype == Token.TEXT:
+                        # Tokenizer 保证这里只会拿到真正的字符串字面量，不会把
+                        # "A1" 中的 A1 误当成单元格引用。
+                        literal = token.value[1:-1].replace('""', '"')
+                        if literal:
+                            formula_literals_to_skip.add(literal)
+                    elif token.subtype == Token.RANGE:
+                        parsed = _parse_formula_range(sheet_idx, token.value)
+                        if parsed is not None:
+                            formula_ranges.append(parsed)
 
     def _cell_in_any_formula_range(sheet_idx: int, row: int, col: int) -> bool:
         for s, r1, c1, r2, c2 in formula_ranges:
@@ -1887,10 +1769,9 @@ def translate_xlsx(data: bytes, translator: Translator, ctx: TranslationContext)
         # 公式（保险起见再判断）
         if s.startswith("="):
             return False
-        # 纯数字 / 含千分位的数字
-        if re.fullmatch(r"[+-]?[\d,]+(\.\d+)?%?", s):
-            return False
-        return True
+        from app.services.text_rules import should_skip_translation
+
+        return not should_skip_translation(s)
 
     for sheet_idx, ws in enumerate(wb.worksheets):
         # 工作表名
