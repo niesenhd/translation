@@ -504,15 +504,25 @@ def _get_tasks_for_user(task_ids: list[str], user, db: Session) -> list[Translat
 # ====== 排队位置与预计等待时间计算 ======
 
 def _avg_task_duration_seconds(db: Session) -> float | None:
-    """计算近期已完成任务的平均耗时（秒），取最近 50 条。"""
-    avg = db.scalar(
-        select(
-            func.avg(
-                func.extract("epoch", TranslationTask.updated_at)
-                - func.extract("epoch", TranslationTask.created_at)
-            )
-        ).where(TranslationTask.status == TaskStatus.SUCCEEDED)
+    """计算近期已完成任务的平均耗时（秒），取最近 50 条。
+
+    使用子查询先筛选最近 50 条 SUCCEEDED 任务，再由外层求平均，
+    避免全量历史数据稀释近期趋势。
+    """
+    duration_expr = (
+        func.extract("epoch", TranslationTask.updated_at)
+        - func.extract("epoch", TranslationTask.created_at)
     )
+    # 子查询：按创建时间倒序取最近 50 条成功任务的耗时
+    subq = (
+        select(duration_expr.label("duration"))
+        .where(TranslationTask.status == TaskStatus.SUCCEEDED)
+        .order_by(TranslationTask.created_at.desc())
+        .limit(50)
+        .subquery()
+    )
+    # 外层：对子查询结果求平均
+    avg = db.scalar(select(func.avg(subq.c.duration)))
     return float(avg) if avg else None
 
 

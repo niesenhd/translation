@@ -352,6 +352,7 @@ async function downloadFile(url, fallbackName) {
   try {
     resp = await api.get(url, {
       responseType: 'blob',
+      timeout: 0,  // 大文件下载不限超时，用户可通过取消按钮主动中止
       signal: controller.signal,
       onDownloadProgress: updateDownloadProgress,
     })
@@ -423,6 +424,7 @@ async function batchDownloadPost(url, fallbackName) {
   try {
     const resp = await api.post(url, ids, {
       responseType: 'blob',
+      timeout: 0,  // 批量下载可能较大，不限超时，用户可通过取消按钮主动中止
       signal: controller.signal,
       onDownloadProgress: updateDownloadProgress,
     })

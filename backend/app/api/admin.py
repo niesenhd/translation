@@ -299,6 +299,7 @@ class UserCreate(BaseModel):
 
 class UserToggleActive(BaseModel):
     is_active: bool
+    reset_to_auto: bool = False  # True 时将 active_override 置为 null，恢复跟随 OA 在职状态
 
 
 @router.get("/users", response_model=list[UserRead])
@@ -426,7 +427,11 @@ def toggle_user_active(
         if u.username == current.username and not payload.is_active:
             raise HTTPException(status_code=400, detail="不能停用自己的账号")
         if u.auth_source == AUTH_SOURCE_OA or u.oa_id:
-            u.active_override = payload.is_active
+            # OA 用户支持三态：reset_to_auto 恢复跟随 OA 在职状态；否则设为强制启用/停用
+            if payload.reset_to_auto:
+                u.active_override = None
+            else:
+                u.active_override = payload.is_active
             u.is_active = is_effectively_active(u)
         else:
             u.is_active = payload.is_active

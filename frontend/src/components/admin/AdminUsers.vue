@@ -39,17 +39,41 @@
         <span v-else class="muted">-</span>
       </template>
     </el-table-column>
-    <el-table-column label="账户启用" width="170">
+    <el-table-column label="账户启用" width="180">
       <template #default="{ row }">
-        <div class="active-control">
-          <el-switch
-            :model-value="row.is_active"
-            @change="value => toggleUserActive(row, value)"
-          />
-          <el-tag v-if="row.active_override === true" size="small" type="success">强制启用</el-tag>
-          <el-tag v-else-if="row.active_override === false" size="small" type="danger">强制停用</el-tag>
-          <el-tag v-else-if="isOaUser(row)" size="small" type="info">跟随OA</el-tag>
-        </div>
+        <!-- 本地用户：二元开关 -->
+        <el-switch
+          v-if="!isOaUser(row)"
+          :model-value="row.is_active"
+          @change="value => toggleLocalUserActive(row, value)"
+        />
+        <!-- OA 用户：三态下拉 -->
+        <el-dropdown
+          v-else
+          trigger="click"
+          @command="cmd => setUserActiveMode(row, cmd)"
+        >
+          <span class="active-mode-trigger">
+            <el-tag
+              size="small"
+              :type="activeModeType(row)"
+              class="active-mode-tag"
+            >{{ activeModeLabel(row) }}</el-tag>
+          </span>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item command="auto" :disabled="row.active_override === null">
+                <el-icon><Refresh /></el-icon> 跟随OA
+              </el-dropdown-item>
+              <el-dropdown-item command="true" :disabled="row.active_override === true">
+                <el-icon><CircleCheck /></el-icon> 强制启用
+              </el-dropdown-item>
+              <el-dropdown-item command="false" :disabled="row.active_override === false">
+                <el-icon><CircleClose /></el-icon> 强制停用
+              </el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
       </template>
     </el-table-column>
   </el-table>
@@ -84,6 +108,7 @@
 <script setup>
 import { onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
+import { Refresh, CircleCheck, CircleClose } from '@element-plus/icons-vue'
 import api from '../../api'
 import { persistBooleanToggle } from '../../toggle'
 import { downloadAllUsersCsv } from '../../user-export'
@@ -159,20 +184,51 @@ async function saveUser() {
   }
 }
 
-async function toggleUserActive(row, value) {
+// 本地用户启停（二元开关）
+async function toggleLocalUserActive(row, value) {
   try {
     row.is_active = value
-    let updatedUser
     await persistBooleanToggle(
       row,
       'is_active',
       async nextValue => {
-        const { data } = await api.put(`/admin/users/${row.id}/active`, { is_active: nextValue })
-        updatedUser = data
+        await api.put(`/admin/users/${row.id}/active`, { is_active: nextValue })
       },
     )
-    if (updatedUser) Object.assign(row, updatedUser)
     ElMessage.success(value ? '已启用' : '已停用')
+  } catch (error) {
+    showError(error, '操作失败')
+  }
+}
+
+// OA 用户三态标签文案
+function activeModeLabel(row) {
+  if (row.active_override === true) return '强制启用'
+  if (row.active_override === false) return '强制停用'
+  return '跟随OA'
+}
+
+// OA 用户三态标签颜色
+function activeModeType(row) {
+  if (row.active_override === true) return 'success'
+  if (row.active_override === false) return 'danger'
+  return 'info'
+}
+
+// OA 用户三态切换：auto=跟随OA / true=强制启用 / false=强制停用
+async function setUserActiveMode(row, command) {
+  try {
+    let payload
+    if (command === 'auto') {
+      payload = { is_active: row.oa_employed, reset_to_auto: true }
+    } else if (command === 'true') {
+      payload = { is_active: true }
+    } else {
+      payload = { is_active: false }
+    }
+    const { data } = await api.put(`/admin/users/${row.id}/active`, payload)
+    Object.assign(row, data)
+    ElMessage.success('已更新')
   } catch (error) {
     showError(error, '操作失败')
   }
@@ -250,9 +306,12 @@ onMounted(fetchUsers)
   font-size: 12px;
 }
 
-.active-control {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+.active-mode-trigger {
+  cursor: pointer;
+  outline: none;
+}
+
+.active-mode-tag {
+  pointer-events: none;
 }
 </style>
